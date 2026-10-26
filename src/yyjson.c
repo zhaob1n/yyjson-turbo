@@ -22,6 +22,23 @@
 
 #include "yyjson.h"
 
+/* Optional SIMD string scanning (compile-time feature detection). */
+#ifndef YYJSON_DISABLE_STR_SIMD
+#  if defined(__AVX512BW__) && defined(YYJSON_ENABLE_AVX512)
+#    define YYJSON_STR_SIMD_AVX512 1
+#    include <immintrin.h>
+#  elif defined(__AVX2__)
+#    define YYJSON_STR_SIMD_AVX2 1
+#    include <immintrin.h>
+#  endif
+#endif
+#ifndef YYJSON_STR_SIMD_AVX512
+#  define YYJSON_STR_SIMD_AVX512 0
+#endif
+#ifndef YYJSON_STR_SIMD_AVX2
+#  define YYJSON_STR_SIMD_AVX2 0
+#endif
+
 
 
 /*==============================================================================
@@ -4876,6 +4893,29 @@ skip_ascii:
 
     repeat16_incr(expr_jump)
     src += 16;
+#if YYJSON_STR_SIMD_AVX512
+    /* long string: 64 bytes per step (only after 16 scalar bytes) */
+    while (eof - src >= 64) {
+        __m512i v = _mm512_loadu_si512((const void *)src);
+        __mmask64 m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"')) |
+                      _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\\')) |
+                      _mm512_cmplt_epi8_mask(v, _mm512_set1_epi8(0x20));
+        if (m) { src += __builtin_ctzll(m); goto skip_ascii_end; }
+        src += 64;
+    }
+#elif YYJSON_STR_SIMD_AVX2
+    /* long string: 32 bytes per step (only after 16 scalar bytes) */
+    while (eof - src >= 32) {
+        __m256i v = _mm256_loadu_si256((const void *)src);
+        __m256i m = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
+                            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v));
+        u32 mask = (u32)_mm256_movemask_epi8(m);
+        if (mask) { src += __builtin_ctz(mask); goto skip_ascii_end; }
+        src += 32;
+    }
+#endif
     goto skip_ascii;
     repeat16_incr(expr_stop)
 
