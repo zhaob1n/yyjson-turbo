@@ -9237,10 +9237,12 @@ static_inline u8 *write_bool(u8 *cur, bool val) {
     Param spaces should not larger than 4. */
 static_inline u8 *write_indent(u8 *cur, usize level, usize spaces, bool tabs) {
     if (likely(!tabs)) {
-        while (level-- > 0) {
-            byte_copy_4(cur, "    ");
-            cur += spaces;
-        }
+        /* block copy: 16 spaces per step, then exact tail (never writes more
+           than the original 4-byte loop could) */
+        usize n = level * spaces;
+        while (n >= 16) { byte_copy_16(cur, "                "); cur += 16; n -= 16; }
+        while (n >= 4) { byte_copy_4(cur, "    "); cur += 4; n -= 4; }
+        if (n) { byte_copy_4(cur, "    "); cur += n; }
     } else if (level) {
         while (level > 4) {
             byte_copy_4(cur, "\t\t\t\t");
