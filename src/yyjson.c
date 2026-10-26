@@ -9005,6 +9005,21 @@ copy_ascii:
     memcpy(cur, src, i); \
     cur += i; src += i; goto copy_utf8;
 
+#if YYJSON_STR_SIMD_AVX2 || YYJSON_STR_SIMD_AVX512
+    /* Fast skip of 32-byte blocks with no byte that could need escaping
+       (conservative superset: < 0x20, >= 0x80, '"', '\\', '/'). */
+    while (end - src >= 32) {
+        __m256i v = _mm256_loadu_si256((const void *)src);
+        __m256i m = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
+                            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
+                            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v)));
+        if (_mm256_movemask_epi8(m)) break;
+        _mm256_storeu_si256((void *)cur, v);
+        cur += 32; src += 32;
+    }
+#endif
     while (end - src >= 16) {
         repeat16_incr(expr_jump)
         byte_copy_16(cur, src);
