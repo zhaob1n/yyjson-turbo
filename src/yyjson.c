@@ -6565,6 +6565,87 @@ static_inline void s1_utf8_step(s1_utf8 *u, __m256i in) {
     u->prev = in;
 }
 
+#if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
+#define S1_Z 1
+typedef struct s1_utf8z {
+    __m512i prev, err, inc;
+} s1_utf8z;
+#define S1_ZB(t) _mm512_broadcast_i32x4(_mm256_castsi256_si128(t))
+static_inline __m512i s1_prevnz(__m512i in, __m512i prev, int n) {
+    __m512i t = _mm512_alignr_epi64(in, prev, 6);
+    switch (n) {
+        case 1: return _mm512_alignr_epi8(in, t, 15);
+        case 2: return _mm512_alignr_epi8(in, t, 14);
+        default: return _mm512_alignr_epi8(in, t, 13);
+    }
+}
+static_inline void s1_utf8_stepz(s1_utf8z *u, __m512i in) {
+    const __m512i nib = _mm512_set1_epi8(0x0F);
+    __m512i prev1 = s1_prevnz(in, u->prev, 1);
+    __m256i t1h_ = S1_T16(
+        S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
+        S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
+        S1_TWO_CONTS, S1_TWO_CONTS, S1_TWO_CONTS, S1_TWO_CONTS,
+        S1_TOO_SHORT | S1_OVERLONG_2,
+        S1_TOO_SHORT,
+        S1_TOO_SHORT | S1_OVERLONG_3 | S1_SURROGATE,
+        S1_TOO_SHORT | S1_TOO_LARGE | S1_TOO_LARGE_1000 | S1_OVERLONG_4);
+    __m256i t1l_ = S1_T16(
+        S1_CARRY | S1_OVERLONG_3 | S1_OVERLONG_2 | S1_OVERLONG_4,
+        S1_CARRY | S1_OVERLONG_2,
+        S1_CARRY, S1_CARRY,
+        S1_CARRY | S1_TOO_LARGE,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000 | S1_SURROGATE,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000);
+    __m256i t2h_ = S1_T16(
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT,
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_OVERLONG_3 |
+            S1_TOO_LARGE_1000 | S1_OVERLONG_4,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_OVERLONG_3 |
+            S1_TOO_LARGE,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_SURROGATE |
+            S1_TOO_LARGE,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_SURROGATE |
+            S1_TOO_LARGE,
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT);
+    __m512i t1h = S1_ZB(t1h_), t1l = S1_ZB(t1l_), t2h = S1_ZB(t2h_);
+    __m512i p1h = _mm512_and_si512(_mm512_srli_epi16(prev1, 4), nib);
+    __m512i p1l = _mm512_and_si512(prev1, nib);
+    __m512i inh = _mm512_and_si512(_mm512_srli_epi16(in, 4), nib);
+    __m512i sc = _mm512_and_si512(
+        _mm512_and_si512(_mm512_shuffle_epi8(t1h, p1h),
+                         _mm512_shuffle_epi8(t1l, p1l)),
+        _mm512_shuffle_epi8(t2h, inh));
+    __m512i prev2 = s1_prevnz(in, u->prev, 2);
+    __m512i prev3 = s1_prevnz(in, u->prev, 3);
+    __m512i is3 = _mm512_subs_epu8(prev2, _mm512_set1_epi8((char)(0xE0 - 0x80)));
+    __m512i is4 = _mm512_subs_epu8(prev3, _mm512_set1_epi8((char)(0xF0 - 0x80)));
+    __m512i must = _mm512_and_si512(_mm512_or_si512(is3, is4),
+                                    _mm512_set1_epi8((char)0x80));
+    u->err = _mm512_or_si512(u->err, _mm512_xor_si512(must, sc));
+    {
+        const __m512i mx = _mm512_inserti64x4(_mm512_set1_epi8(-1), _mm256_setr_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1)), 1);
+        u->inc = _mm512_subs_epu8(in, mx);
+    }
+    u->prev = in;
+}
+
+#else
+#define S1_Z 0
+#endif
 static_inline void s1_utf8_block(s1_utf8 *u, const u8 *p, u64 hi) {
     __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)p);
     __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
@@ -6690,7 +6771,11 @@ static_inline u32 *s1_write(u32 *out, u32 base, u64 bits) {
 
 typedef struct s1_st {
     u64 next_esc, prev_in, prev_scalar;
+#if S1_Z
+    s1_utf8z u;
+#else
     s1_utf8 u;
+#endif
 } s1_st;
 
 /* One 64-byte block: returns structural bits, stores the special mask. */
@@ -6715,9 +6800,14 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
         qt = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('"'));
         bs = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('\\'));
         ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
-        a = _mm512_castsi512_si256(z);
-        b = _mm512_extracti64x4_epi64(z, 1);
-        (void)v20; (void)v1f; (void)vq; (void)vb;
+        (void)v20; (void)v1f; (void)vq; (void)vb; (void)a; (void)b;
+        if (likely(!_mm512_movepi8_mask(z))) {
+            s->u.err = _mm512_or_si512(s->u.err, s->u.inc);
+            s->u.inc = _mm512_setzero_si512();
+            s->u.prev = z;
+        } else {
+            s1_utf8_stepz(&s->u, z);
+        }
     }
 #else
     a = _mm256_loadu_si256((const __m256i *)(const void *)p);
@@ -6736,7 +6826,6 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
     bs = s1_mm2(_mm256_cmpeq_epi8(a, vb), _mm256_cmpeq_epi8(b, vb));
     ctrl = s1_mm2(_mm256_cmpeq_epi8(_mm256_min_epu8(a, v1f), a),
                   _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
-#endif
     /* utf8_lookup4: skip pure-ASCII 64-byte blocks */
     if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
         s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
@@ -6746,6 +6835,7 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
         s1_utf8_step(&s->u, a);
         s1_utf8_step(&s->u, b);
     }
+#endif
     /* json_escape_scanner */
     if (likely(!bs)) {
         escaped = s->next_esc;
@@ -6779,7 +6869,11 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     usize pos = 0, blk = 0, full = len & ~(usize)63;
     u8 tmp[64];
     s.next_esc = s.prev_in = s.prev_scalar = 0;
+#if S1_Z
+    s.u.prev = s.u.err = s.u.inc = _mm512_setzero_si512();
+#else
     s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
+#endif
     for (; pos < full; pos += 64, blk++) {
         st = s1_block(buf + pos, dst != buf ? dst + pos : NULL, &s, spc + blk);
         /* bit_indexer: write previous block while this one is in flight */
@@ -6798,8 +6892,13 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     }
     out = s1_write(out, prev_base, prev_st);
     if (s.prev_in) return false;
+#if S1_Z
+    s.u.err = _mm512_or_si512(s.u.err, s.u.inc);
+    *utf8_ok = _mm512_test_epi8_mask(s.u.err, s.u.err) == 0;
+#else
     s.u.err = _mm256_or_si256(s.u.err, s.u.inc);
     *utf8_ok = _mm256_testz_si256(s.u.err, s.u.err) != 0;
+#endif
     if (!*utf8_ok) return false;
     *ntok = (usize)(out - idx);
     out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
@@ -7372,13 +7471,25 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
     if (!idx) return 1; /* no memory for index: use regular reader */
     spc = (u64 *)alc.malloc(alc.ctx, (len / 64 + 2) * sizeof(u64));
     if (!spc) { alc.free(alc.ctx, idx); return 1; }
+#ifdef YYJSON_S1_PROF
+    { extern u64 s1_prof_t[4]; u64 t0 = __rdtsc();
+#endif
     if (!s1_index(src, hdr, len, idx, spc, &ntok, &utf8_ok)) {
         ret = 1;
     } else {
         bool oom = false;
+#ifdef YYJSON_S1_PROF
+        u64 t1 = __rdtsc(); s1_prof_t[0] += t1 - t0; t0 = t1;
+#endif
         *doc_out = s1_build(hdr, eof, idx, spc, ntok, alc, flg, &oom);
+#ifdef YYJSON_S1_PROF
+        s1_prof_t[1] += __rdtsc() - t0; s1_prof_t[2] += ntok;
+#endif
         ret = *doc_out ? 0 : (oom ? 1 : 2);
     }
+#ifdef YYJSON_S1_PROF
+    }
+#endif
     alc.free(alc.ctx, spc);
     alc.free(alc.ctx, idx);
     return ret;
