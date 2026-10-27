@@ -6884,6 +6884,95 @@ static_inline bool s1_has_spc(const u64 *spc, usize a, usize b) {
     return (spc[wb] & mb) != 0;
 }
 
+#if S1_AVX2
+/* Move n bytes forward-down (dst <= src) without touching bytes past dst+n. */
+static_inline void s1_mov(u8 *dst, const u8 *src, usize n) {
+#if defined(__AVX512BW__)
+    while (n >= 64) {
+        __m512i v = _mm512_loadu_si512((const void *)src);
+        _mm512_storeu_si512((void *)dst, v);
+        src += 64; dst += 64; n -= 64;
+    }
+    if (n) {
+        __mmask64 m = (((u64)1 << n) - 1);
+        __m512i v = _mm512_maskz_loadu_epi8(m, (const void *)src);
+        _mm512_mask_storeu_epi8((void *)dst, m, v);
+    }
+#else
+    while (n >= 8) { u64 t; memcpy(&t, src, 8); memcpy(dst, &t, 8);
+        src += 8; dst += 8; n -= 8; }
+    while (n--) *dst++ = *src++;
+#endif
+}
+
+/* Unescape a string whose special bytes (backslash / control) are known from
+   the stage-1 `spc` bitmap: copy runs between them with vector moves instead
+   of yyjson's per-byte loop. Returns false on any error (caller falls back). */
+static_noinline bool s1_str_esc(u8 *hdr, u8 *s_beg, u8 *s_end,
+                                const u64 *spc, yyjson_val *val) {
+    u8 *src = s_beg, *dst = s_beg;
+    usize end = (usize)(s_end - hdr), pos = (usize)(s_beg - hdr), w, p, n;
+    const char *msg;
+    u64 m;
+    w = pos >> 6;
+    m = spc[w] & (~(u64)0 << (pos & 63));
+    for (;;) {
+        while (!m) {
+            w++;
+            if ((w << 6) >= end) { p = end; goto found; }
+            m = spc[w];
+        }
+        p = (w << 6) + (usize)__builtin_ctzll(m);
+        if (p > end) p = end;
+found:
+        n = (usize)((hdr + p) - src);
+        if (dst != src) {
+            if (n <= 16) {
+                while (n >= 4) { u32 t; memcpy(&t, src, 4); memcpy(dst, &t, 4);
+                    src += 4; dst += 4; n -= 4; }
+                while (n) { *dst++ = *src++; n--; }
+            } else {
+                s1_mov(dst, src, n);
+                dst += n; src += n;
+            }
+        } else {
+            dst += n; src += n;
+        }
+        if (p == end) break;
+        if (*src != '\\') return false; /* control char */
+esc_again:
+        switch (src[1]) {
+            case '"':  *dst++ = '"';  src += 2; break;
+            case '\\': *dst++ = '\\'; src += 2; break;
+            case '/':  *dst++ = '/';  src += 2; break;
+            case 'b':  *dst++ = '\b'; src += 2; break;
+            case 'f':  *dst++ = '\f'; src += 2; break;
+            case 'n':  *dst++ = '\n'; src += 2; break;
+            case 'r':  *dst++ = '\r'; src += 2; break;
+            case 't':  *dst++ = '\t'; src += 2; break;
+            case 'u':
+                if (!read_uni_esc(&src, &dst, &msg)) return false;
+                break;
+            default: return false;
+        }
+        if (src > s_end) return false;
+        if (*src == '\\' && src < s_end) goto esc_again; /* escape runs */
+        pos = (usize)(src - hdr);
+        if ((pos >> 6) == w) {
+            m &= ~(u64)0 << (pos & 63);
+        } else {
+            w = pos >> 6;
+            m = spc[w] & (~(u64)0 << (pos & 63));
+        }
+    }
+    val->tag = ((u64)(dst - s_beg) << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
+    val->uni.str = (const char *)s_beg;
+    *dst = '\0';
+    return true;
+}
+
+#endif /* S1_AVX2 */
+
 /* Stage 2. Returns NULL with *retry=true on any failure (caller falls back). */
 static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
                                      const u64 *spc, usize ntok,
@@ -6911,6 +7000,16 @@ static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
 #define S1_NEXT() (cur = hdr + *ip++)
 #define S1_SCALAR_END() do { nxt = hdr + *ip; \
     if (unlikely(cur != nxt && !char_is_space(*cur))) goto fail; } while (0)
+#if S1_AVX2 /* spc = backslash|ctrl; UTF-8 already validated */
+#define S1_STR_ESC() do { \
+    if (unlikely(!s1_str_esc(hdr, s_beg, s_end, spc, val))) goto fail; \
+    } while (0)
+#else /* spc also marks non-ASCII: let read_str validate UTF-8 */
+#define S1_STR_ESC() do { \
+    if (unlikely(!read_str(&cur, eof, flg, val, &msg))) goto fail; \
+    if (unlikely(cur != s_end + 1)) goto fail; \
+    } while (0)
+#endif
 #define S1_STR() do { \
     u8 *s_beg = cur + 1, *s_end = hdr + *ip++; \
     if (likely(!s1_has_spc(spc, (usize)(s_beg - hdr), (usize)(s_end - hdr)))) { \
@@ -6919,8 +7018,7 @@ static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
         val->uni.str = (const char *)s_beg; \
         *s_end = '\0'; \
     } else { \
-        if (unlikely(!read_str(&cur, eof, flg, val, &msg))) goto fail; \
-        if (unlikely(cur != s_end + 1)) goto fail; \
+        S1_STR_ESC(); \
     } } while (0)
 
     S1_NEXT();
@@ -7088,6 +7186,7 @@ fail:
 #undef S1_NEXT
 #undef S1_SCALAR_END
 #undef S1_STR
+#undef S1_STR_ESC
 }
 
 /* 0: success (doc set), 1: fall back (buffer untouched), 2: fall back
