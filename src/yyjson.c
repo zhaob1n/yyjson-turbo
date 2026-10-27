@@ -6706,9 +6706,9 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
 #if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
     {   /* 64-byte classify as in simdjson icelake (one zmm per block) */
         const __m512i z = _mm512_loadu_si512((const void *)p);
-        _mm512_storeu_si512((void *)d, z); /* fused input copy */
         const __m512i wt = _mm512_broadcast_i32x4(_mm256_castsi256_si128(wtab));
         const __m512i ot = _mm512_broadcast_i32x4(_mm256_castsi256_si128(otab));
+        _mm512_storeu_si512((void *)d, z); /* fused input copy */
         ws = _mm512_cmpeq_epi8_mask(z, _mm512_shuffle_epi8(wt, z));
         op = _mm512_cmpeq_epi8_mask(_mm512_or_si512(z, _mm512_set1_epi8(0x20)),
                                     _mm512_shuffle_epi8(ot, z));
