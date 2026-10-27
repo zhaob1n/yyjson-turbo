@@ -6708,7 +6708,7 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
         const __m512i z = _mm512_loadu_si512((const void *)p);
         const __m512i wt = _mm512_broadcast_i32x4(_mm256_castsi256_si128(wtab));
         const __m512i ot = _mm512_broadcast_i32x4(_mm256_castsi256_si128(otab));
-        _mm512_storeu_si512((void *)d, z); /* fused input copy */
+        if (d) _mm512_storeu_si512((void *)d, z); /* fused input copy */
         ws = _mm512_cmpeq_epi8_mask(z, _mm512_shuffle_epi8(wt, z));
         op = _mm512_cmpeq_epi8_mask(_mm512_or_si512(z, _mm512_set1_epi8(0x20)),
                                     _mm512_shuffle_epi8(ot, z));
@@ -6722,8 +6722,10 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
 #else
     a = _mm256_loadu_si256((const __m256i *)(const void *)p);
     b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
-    _mm256_storeu_si256((__m256i *)(void *)d, a); /* fused input copy */
-    _mm256_storeu_si256((__m256i *)(void *)(d + 32), b);
+    if (d) { /* fused input copy */
+        _mm256_storeu_si256((__m256i *)(void *)d, a);
+        _mm256_storeu_si256((__m256i *)(void *)(d + 32), b);
+    }
     ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
                 _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(wtab, b)));
     op = s1_mm2(_mm256_cmpeq_epi8(_mm256_or_si256(a, v20),
@@ -6779,7 +6781,7 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     s.next_esc = s.prev_in = s.prev_scalar = 0;
     s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
     for (; pos < full; pos += 64, blk++) {
-        st = s1_block(buf + pos, dst + pos, &s, spc + blk);
+        st = s1_block(buf + pos, dst != buf ? dst + pos : NULL, &s, spc + blk);
         /* bit_indexer: write previous block while this one is in flight */
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
@@ -6788,7 +6790,7 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     if (pos < len) {
         memset(tmp, ' ', 64);
         memcpy(tmp, buf + pos, len - pos);
-        st = s1_block(tmp, tmp, &s, spc + blk);
+        st = s1_block(tmp, NULL, &s, spc + blk);
         if (dst != buf) memcpy(dst + pos, buf + pos, len - pos);
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
