@@ -893,6 +893,11 @@ static const yyjson_read_flag YYJSON_READ_ALLOW_SINGLE_QUOTED_STR   = 1 << 12;
     non-whitespace character with code point above `U+007F`. */
 static const yyjson_read_flag YYJSON_READ_ALLOW_UNQUOTED_KEY        = 1 << 13;
 
+/** Use the optional two-stage (SIMD structural index) reader.
+    Only effective with no other flags except INSITU; otherwise ignored.
+    The produced DOM is identical to the regular reader. */
+static const yyjson_read_flag YYJSON_READ_STAGE1                    = 1 << 15;
+
 /** Allow JSON5 format, see: [https://json5.org].
     This flag supports all JSON5 features with some additional extensions:
     - Accepts more escape sequences than JSON5 (e.g. `\a`, `\e`).

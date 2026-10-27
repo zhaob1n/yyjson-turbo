@@ -4906,7 +4906,7 @@ skip_ascii:
 #elif YYJSON_STR_SIMD_AVX2
     /* long string: 32 bytes per step (only after 16 scalar bytes) */
     while (eof - src >= 32) {
-        __m256i v = _mm256_loadu_si256((const void *)src);
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
         __m256i m = _mm256_or_si256(
             _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
                             _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
@@ -6355,6 +6355,567 @@ fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
  * MARK: - JSON Reader (Public)
  *============================================================================*/
 
+/*==============================================================================
+ * MARK: - Two-Stage Reader (Optional, YYJSON_READ_STAGE1)
+ * Stage 1: SIMD structural indexing over 64-byte blocks (simdjson-style).
+ * Stage 2: build the regular yyjson DOM from the index, reusing read_str /
+ *          read_num. Any stage-1 failure falls back to the regular reader.
+ *============================================================================*/
+#ifndef YYJSON_DISABLE_STAGE1
+#if defined(__AVX2__) || defined(__AVX512BW__)
+#include <immintrin.h>
+#endif
+#if defined(__AVX512BW__) && defined(__AVX512F__) && defined(YYJSON_STAGE1_AVX512)
+#define S1_AVX512 1
+#else
+#define S1_AVX512 0
+#endif
+#if defined(__AVX2__) && !defined(YYJSON_STAGE1_SCALAR)
+#define S1_AVX2 1
+#else
+#define S1_AVX2 0
+#undef S1_AVX512
+#define S1_AVX512 0
+#endif
+#if defined(__PCLMUL__) && !defined(YYJSON_STAGE1_SCALAR)
+#define S1_CLMUL 1
+#else
+#define S1_CLMUL 0
+#endif
+
+typedef struct s1_masks {
+    u64 bs, qt, op, ws, ctrl, hi;
+} s1_masks;
+
+static_inline u64 s1_prefix_xor(u64 x) {
+#if S1_CLMUL
+    __m128i r = _mm_clmulepi64_si128(_mm_set_epi64x(0, (i64)x),
+                                     _mm_set1_epi8((char)0xFF), 0);
+    return (u64)_mm_cvtsi128_si64(r);
+#else
+    x ^= x << 1; x ^= x << 2; x ^= x << 4;
+    x ^= x << 8; x ^= x << 16; x ^= x << 32;
+    return x;
+#endif
+}
+
+static_inline u32 s1_popcnt(u64 x) { return (u32)__builtin_popcountll(x); }
+
+#if S1_AVX2
+static_inline u64 s1_mm2(__m256i lo, __m256i hi) {
+    return (u64)(u32)_mm256_movemask_epi8(lo) |
+           ((u64)(u32)_mm256_movemask_epi8(hi) << 32);
+}
+#endif
+
+static_inline void s1_classify(const u8 *p, s1_masks *m) {
+#if S1_AVX512
+    __m512i v = _mm512_loadu_si512((const void *)p);
+#define S1EQ(c) _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c))
+    m->bs = S1EQ('\\');
+    m->qt = S1EQ('"');
+    m->op = S1EQ('{') | S1EQ('}') | S1EQ('[') | S1EQ(']') |
+            S1EQ(':') | S1EQ(',');
+    m->ws = S1EQ(' ') | S1EQ('\n') | S1EQ('\r') | S1EQ('\t');
+    m->ctrl = _mm512_cmplt_epu8_mask(v, _mm512_set1_epi8(0x20));
+    m->hi = _mm512_movepi8_mask(v);
+#undef S1EQ
+#elif S1_AVX2
+    __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+#define S1EQ(x, c) _mm256_cmpeq_epi8(x, _mm256_set1_epi8(c))
+#define S1M(expr_a, expr_b) s1_mm2(expr_a, expr_b)
+    m->bs = S1M(S1EQ(a, '\\'), S1EQ(b, '\\'));
+    m->qt = S1M(S1EQ(a, '"'), S1EQ(b, '"'));
+    {
+        /* {=7B }=7D [=5B ]=5D : , ; (c|0x20) maps [ ] to { } */
+        __m256i a2 = _mm256_or_si256(a, _mm256_set1_epi8(0x20));
+        __m256i b2 = _mm256_or_si256(b, _mm256_set1_epi8(0x20));
+        __m256i oa = _mm256_or_si256(
+            _mm256_or_si256(S1EQ(a2, '{'), S1EQ(a2, '}')),
+            _mm256_or_si256(S1EQ(a, ':'), S1EQ(a, ',')));
+        __m256i ob = _mm256_or_si256(
+            _mm256_or_si256(S1EQ(b2, '{'), S1EQ(b2, '}')),
+            _mm256_or_si256(S1EQ(b, ':'), S1EQ(b, ',')));
+        m->op = S1M(oa, ob);
+    }
+    {
+        /* whitespace via shuffle: ' '=20 \t=09 \n=0A \r=0D, low nibble lookup */
+        const __m256i wtab = _mm256_setr_epi8(
+            ' ', 0, 0, 0, 0, 0, 0, 0, 0, '\t', '\n', 0, 0, '\r', 0, 0,
+            ' ', 0, 0, 0, 0, 0, 0, 0, 0, '\t', '\n', 0, 0, '\r', 0, 0);
+        __m256i wa = _mm256_cmpeq_epi8(_mm256_shuffle_epi8(wtab, a), a);
+        __m256i wb = _mm256_cmpeq_epi8(_mm256_shuffle_epi8(wtab, b), b);
+        m->ws = S1M(wa, wb);
+    }
+    {
+        __m256i c1 = _mm256_set1_epi8(0x1F);
+        m->ctrl = S1M(_mm256_cmpeq_epi8(_mm256_min_epu8(a, c1), a),
+                      _mm256_cmpeq_epi8(_mm256_min_epu8(b, c1), b));
+    }
+    m->hi = s1_mm2(a, b);
+#undef S1EQ
+#undef S1M
+#else
+    usize i;
+    m->bs = m->qt = m->op = m->ws = m->ctrl = m->hi = 0;
+    for (i = 0; i < 64; i++) {
+        u8 c = p[i];
+        u64 bit = (u64)1 << i;
+        if (c == '\\') m->bs |= bit;
+        if (c == '"') m->qt |= bit;
+        if (c == '{' || c == '}' || c == '[' || c == ']' ||
+            c == ':' || c == ',') m->op |= bit;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') m->ws |= bit;
+        if (c < 0x20) m->ctrl |= bit;
+        if (c >= 0x80) m->hi |= bit;
+    }
+#endif
+}
+
+#if S1_AVX2
+/* simdjson "lookup" UTF-8 validation (AVX2, 32 bytes per step). */
+#define S1_TOO_SHORT  (1 << 0)
+#define S1_TOO_LONG   (1 << 1)
+#define S1_OVERLONG_3 (1 << 2)
+#define S1_TOO_LARGE  (1 << 3)
+#define S1_SURROGATE  (1 << 4)
+#define S1_OVERLONG_2 (1 << 5)
+#define S1_TOO_LARGE_1000 (1 << 6)
+#define S1_OVERLONG_4 (1 << 6)
+#define S1_TWO_CONTS  (-128)
+#define S1_CARRY (S1_TOO_SHORT | S1_TOO_LONG | S1_TWO_CONTS)
+
+typedef struct s1_utf8 {
+    __m256i prev, err, inc;
+} s1_utf8;
+
+static_inline __m256i s1_prevn(__m256i in, __m256i prev, int n) {
+    __m256i t = _mm256_permute2x128_si256(prev, in, 0x21);
+    switch (n) {
+        case 1: return _mm256_alignr_epi8(in, t, 15);
+        case 2: return _mm256_alignr_epi8(in, t, 14);
+        default: return _mm256_alignr_epi8(in, t, 13);
+    }
+}
+
+#define S1_T16(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15) \
+    _mm256_setr_epi8(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15, a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15)
+
+static_inline void s1_utf8_step(s1_utf8 *u, __m256i in) {
+    const __m256i nib = _mm256_set1_epi8(0x0F);
+    __m256i prev1 = s1_prevn(in, u->prev, 1);
+    __m256i t1h = S1_T16(
+        S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
+        S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
+        S1_TWO_CONTS, S1_TWO_CONTS, S1_TWO_CONTS, S1_TWO_CONTS,
+        S1_TOO_SHORT | S1_OVERLONG_2,
+        S1_TOO_SHORT,
+        S1_TOO_SHORT | S1_OVERLONG_3 | S1_SURROGATE,
+        S1_TOO_SHORT | S1_TOO_LARGE | S1_TOO_LARGE_1000 | S1_OVERLONG_4);
+    __m256i t1l = S1_T16(
+        S1_CARRY | S1_OVERLONG_3 | S1_OVERLONG_2 | S1_OVERLONG_4,
+        S1_CARRY | S1_OVERLONG_2,
+        S1_CARRY, S1_CARRY,
+        S1_CARRY | S1_TOO_LARGE,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000 | S1_SURROGATE,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000,
+        S1_CARRY | S1_TOO_LARGE | S1_TOO_LARGE_1000);
+    __m256i t2h = S1_T16(
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT,
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_OVERLONG_3 |
+            S1_TOO_LARGE_1000 | S1_OVERLONG_4,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_OVERLONG_3 |
+            S1_TOO_LARGE,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_SURROGATE |
+            S1_TOO_LARGE,
+        S1_TOO_LONG | S1_OVERLONG_2 | S1_TWO_CONTS | S1_SURROGATE |
+            S1_TOO_LARGE,
+        S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT, S1_TOO_SHORT);
+    __m256i p1h = _mm256_and_si256(_mm256_srli_epi16(prev1, 4), nib);
+    __m256i p1l = _mm256_and_si256(prev1, nib);
+    __m256i inh = _mm256_and_si256(_mm256_srli_epi16(in, 4), nib);
+    __m256i sc = _mm256_and_si256(
+        _mm256_and_si256(_mm256_shuffle_epi8(t1h, p1h),
+                         _mm256_shuffle_epi8(t1l, p1l)),
+        _mm256_shuffle_epi8(t2h, inh));
+    __m256i prev2 = s1_prevn(in, u->prev, 2);
+    __m256i prev3 = s1_prevn(in, u->prev, 3);
+    __m256i is3 = _mm256_subs_epu8(prev2, _mm256_set1_epi8((char)(0xE0 - 0x80)));
+    __m256i is4 = _mm256_subs_epu8(prev3, _mm256_set1_epi8((char)(0xF0 - 0x80)));
+    __m256i must = _mm256_and_si256(_mm256_or_si256(is3, is4),
+                                    _mm256_set1_epi8((char)0x80));
+    u->err = _mm256_or_si256(u->err, _mm256_xor_si256(must, sc));
+    {
+        const __m256i mx = _mm256_setr_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1));
+        u->inc = _mm256_subs_epu8(in, mx);
+    }
+    u->prev = in;
+}
+
+static_inline void s1_utf8_block(s1_utf8 *u, const u8 *p, u64 hi) {
+    __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+    if (likely(!hi)) {
+        u->err = _mm256_or_si256(u->err, u->inc);
+        u->inc = _mm256_setzero_si256();
+        u->prev = b;
+        return;
+    }
+    s1_utf8_step(u, a);
+    s1_utf8_step(u, b);
+}
+#endif
+
+#define S1_ODD U64(0xAAAAAAAA, 0xAAAAAAAA)
+#if defined(__GNUC__) || defined(__clang__)
+#define S1_BARRIER(x) __asm__("" : "+r"(x)) /* block SLP vectorization */
+#else
+#define S1_BARRIER(x)
+#endif
+
+static_inline u32 *s1_flatten(u32 *out, u32 base, u64 bits) {
+    u32 n;
+    if (!bits) return out;
+    n = s1_popcnt(bits);
+#define S1_STEP(i) { u64 t_ = (u64)__builtin_ctzll(bits | ((u64)1 << 63)); \
+    S1_BARRIER(t_); out[i] = base + (u32)t_; bits &= bits - 1; }
+    /* bits|1<<63 keeps ctz defined; extra slots are overwritten later */
+    S1_STEP(0) S1_STEP(1) S1_STEP(2) S1_STEP(3)
+    S1_STEP(4) S1_STEP(5) S1_STEP(6) S1_STEP(7)
+    if (unlikely(n > 8)) {
+        S1_STEP(8) S1_STEP(9) S1_STEP(10) S1_STEP(11)
+        S1_STEP(12) S1_STEP(13) S1_STEP(14) S1_STEP(15)
+        if (unlikely(n > 16)) {
+            u32 i = 16;
+            while (bits) { out[i++] = base + (u32)__builtin_ctzll(bits);
+                           bits &= bits - 1; }
+        }
+    }
+#undef S1_STEP
+    return out + n;
+}
+
+/* Build structural index. Returns false if the regular reader must be used
+   (unclosed string or invalid UTF-8). Nothing in `buf` is modified. */
+static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+                              usize *ntok, bool *utf8_ok) {
+    u64 prev_esc = 0, prev_in = 0, prev_scalar = 0;
+    u32 *out = idx;
+    usize pos;
+    u8 tmp[64];
+#if S1_AVX2
+    s1_utf8 u;
+    u.prev = u.err = u.inc = _mm256_setzero_si256();
+#endif
+    for (pos = 0; pos < len; pos += 64) {
+        const u8 *p = buf + pos;
+        s1_masks m;
+        u64 escaped, quote, in_str, scalar, sstart, st;
+        if (unlikely(len - pos < 64)) {
+            memset(tmp, ' ', 64);
+            memcpy(tmp, p, len - pos);
+            p = tmp;
+        }
+        s1_classify(p, &m);
+        S1_BARRIER(m.op); S1_BARRIER(m.ws); S1_BARRIER(m.qt);
+        S1_BARRIER(m.bs); S1_BARRIER(m.ctrl); S1_BARRIER(m.hi);
+#if S1_AVX2
+        s1_utf8_block(&u, p, m.hi);
+#endif
+        if (!m.bs) {
+            escaped = prev_esc;
+            prev_esc = 0;
+        } else {
+            u64 pe = m.bs & ~prev_esc;
+            u64 ec = (((pe << 1) | S1_ODD) - pe) ^ S1_ODD;
+            escaped = ec ^ (m.bs | prev_esc);
+            prev_esc = (ec & m.bs) >> 63;
+        }
+        quote = m.qt & ~escaped;
+        in_str = s1_prefix_xor(quote) ^ prev_in;
+        prev_in = (u64)((i64)in_str >> 63);
+        scalar = ~(m.op | m.ws | quote | in_str);
+        sstart = scalar & ~((scalar << 1) | prev_scalar);
+        prev_scalar = scalar >> 63;
+        st = (m.op & ~in_str) | quote | sstart;
+#if S1_AVX2
+        spc[pos >> 6] = m.bs | m.ctrl;
+#else
+        spc[pos >> 6] = m.bs | m.ctrl | m.hi;
+#endif
+        out = s1_flatten(out, (u32)pos, st);
+    }
+    if (prev_in) return false;
+#if S1_AVX2
+    u.err = _mm256_or_si256(u.err, u.inc);
+    *utf8_ok = _mm256_testz_si256(u.err, u.err) != 0;
+    if (!*utf8_ok) return false;
+#else
+    *utf8_ok = true;
+#endif
+    *ntok = (usize)(out - idx);
+    out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
+    return true;
+}
+
+static_inline bool s1_has_spc(const u64 *spc, usize a, usize b) {
+    usize wa, wb, w;
+    u64 ma, mb;
+    if (a >= b) return false;
+    wa = a >> 6; wb = (b - 1) >> 6;
+    ma = ~(u64)0 << (a & 63);
+    mb = ~(u64)0 >> (63 - ((b - 1) & 63));
+    if (wa == wb) return (spc[wa] & ma & mb) != 0;
+    if (spc[wa] & ma) return true;
+    for (w = wa + 1; w < wb; w++) if (spc[w]) return true;
+    return (spc[wb] & mb) != 0;
+}
+
+/* Stage 2. Returns NULL with *retry=true on any failure (caller falls back). */
+static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
+                                     const u64 *spc, usize ntok,
+                                     yyjson_alc alc, yyjson_read_flag flg,
+                                     bool *oom) {
+    usize hdr_len, alc_len, ctn_len;
+    yyjson_val *val_hdr, *val, *ctn, *ctn_parent;
+    yyjson_doc *doc;
+    const char *msg;
+    const u32 *ip = idx;
+    u8 *cur, *nxt;
+    u8 raw_end[1];
+    u8 *raw_ptr = raw_end;
+    u8 **pre = &raw_ptr;
+
+    hdr_len = sizeof(yyjson_doc) / sizeof(yyjson_val);
+    hdr_len += (sizeof(yyjson_doc) % sizeof(yyjson_val)) > 0;
+    alc_len = hdr_len + ntok + 4;
+    val_hdr = (yyjson_val *)alc.malloc(alc.ctx, alc_len * sizeof(yyjson_val));
+    if (unlikely(!val_hdr)) { *oom = true; return NULL; }
+    val = val_hdr + hdr_len;
+    ctn = val;
+    ctn_len = 0;
+
+#define S1_NEXT() (cur = hdr + *ip++)
+#define S1_SCALAR_END() do { nxt = hdr + *ip; \
+    if (unlikely(cur != nxt && !char_is_space(*cur))) goto fail; } while (0)
+#define S1_STR() do { \
+    u8 *s_beg = cur + 1, *s_end = hdr + *ip++; \
+    if (likely(!s1_has_spc(spc, (usize)(s_beg - hdr), (usize)(s_end - hdr)))) { \
+        val->tag = ((u64)(s_end - s_beg) << YYJSON_TAG_BIT) | \
+                   YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC; \
+        val->uni.str = (const char *)s_beg; \
+        *s_end = '\0'; \
+    } else { \
+        if (unlikely(!read_str(&cur, eof, flg, val, &msg))) goto fail; \
+        if (unlikely(cur != s_end + 1)) goto fail; \
+    } } while (0)
+
+    S1_NEXT();
+    if (*cur == '{') {
+        ctn->tag = YYJSON_TYPE_OBJ;
+        ctn->uni.ofs = 0;
+        goto obj_key_begin;
+    } else if (*cur == '[') {
+        ctn->tag = YYJSON_TYPE_ARR;
+        ctn->uni.ofs = 0;
+        goto arr_val_begin;
+    }
+    goto fail;
+
+arr_begin:
+    ctn->tag = (((u64)ctn_len + 1) << YYJSON_TAG_BIT) |
+               (ctn->tag & YYJSON_TAG_MASK);
+    val++;
+    val->tag = YYJSON_TYPE_ARR;
+    val->uni.ofs = (usize)((u8 *)val - (u8 *)ctn);
+    ctn = val;
+    ctn_len = 0;
+
+arr_val_begin:
+    S1_NEXT();
+    if (*cur == '"') {
+        val++; ctn_len++;
+        S1_STR();
+        goto arr_val_end;
+    }
+    if (*cur == '{') goto obj_begin;
+    if (*cur == '[') goto arr_begin;
+    if (char_is_num(*cur)) {
+        val++; ctn_len++;
+        if (unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail;
+        S1_SCALAR_END();
+        goto arr_val_end;
+    }
+    if (*cur == 't') {
+        val++; ctn_len++;
+        if (unlikely(!read_true(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto arr_val_end;
+    }
+    if (*cur == 'f') {
+        val++; ctn_len++;
+        if (unlikely(!read_false(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto arr_val_end;
+    }
+    if (*cur == 'n') {
+        val++; ctn_len++;
+        if (unlikely(!read_null(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto arr_val_end;
+    }
+    if (*cur == ']' && ctn_len == 0) goto arr_end;
+    goto fail;
+
+arr_val_end:
+    S1_NEXT();
+    if (likely(*cur == ',')) goto arr_val_begin;
+    if (likely(*cur == ']')) goto arr_end;
+    goto fail;
+
+arr_end:
+    ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
+    ctn->uni.ofs = (usize)((u8 *)val - (u8 *)ctn) + sizeof(yyjson_val);
+    ctn->tag = ((ctn_len) << YYJSON_TAG_BIT) | YYJSON_TYPE_ARR;
+    if (unlikely(ctn == ctn_parent)) goto doc_end;
+    ctn = ctn_parent;
+    ctn_len = (usize)(ctn->tag >> YYJSON_TAG_BIT);
+    if ((ctn->tag & YYJSON_TYPE_MASK) == YYJSON_TYPE_OBJ) goto obj_val_end;
+    goto arr_val_end;
+
+obj_begin:
+    ctn->tag = (((u64)ctn_len + 1) << YYJSON_TAG_BIT) |
+               (ctn->tag & YYJSON_TAG_MASK);
+    val++;
+    val->tag = YYJSON_TYPE_OBJ;
+    val->uni.ofs = (usize)((u8 *)val - (u8 *)ctn);
+    ctn = val;
+    ctn_len = 0;
+
+obj_key_begin:
+    S1_NEXT();
+    if (likely(*cur == '"')) {
+        val++; ctn_len++;
+        S1_STR();
+        goto obj_key_end;
+    }
+    if (*cur == '}' && ctn_len == 0) goto obj_end;
+    goto fail;
+
+obj_key_end:
+    S1_NEXT();
+    if (likely(*cur == ':')) goto obj_val_begin;
+    goto fail;
+
+obj_val_begin:
+    S1_NEXT();
+    if (*cur == '"') {
+        val++; ctn_len++;
+        S1_STR();
+        goto obj_val_end;
+    }
+    if (char_is_num(*cur)) {
+        val++; ctn_len++;
+        if (unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail;
+        S1_SCALAR_END();
+        goto obj_val_end;
+    }
+    if (*cur == '{') goto obj_begin;
+    if (*cur == '[') goto arr_begin;
+    if (*cur == 't') {
+        val++; ctn_len++;
+        if (unlikely(!read_true(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto obj_val_end;
+    }
+    if (*cur == 'f') {
+        val++; ctn_len++;
+        if (unlikely(!read_false(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto obj_val_end;
+    }
+    if (*cur == 'n') {
+        val++; ctn_len++;
+        if (unlikely(!read_null(&cur, val))) goto fail;
+        S1_SCALAR_END();
+        goto obj_val_end;
+    }
+    goto fail;
+
+obj_val_end:
+    S1_NEXT();
+    if (likely(*cur == ',')) goto obj_key_begin;
+    if (likely(*cur == '}')) goto obj_end;
+    goto fail;
+
+obj_end:
+    ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
+    ctn->uni.ofs = (usize)((u8 *)val - (u8 *)ctn) + sizeof(yyjson_val);
+    ctn->tag = (ctn_len << (YYJSON_TAG_BIT - 1)) | YYJSON_TYPE_OBJ;
+    if (unlikely(ctn == ctn_parent)) goto doc_end;
+    ctn = ctn_parent;
+    ctn_len = (usize)(ctn->tag >> YYJSON_TAG_BIT);
+    if ((ctn->tag & YYJSON_TYPE_MASK) == YYJSON_TYPE_OBJ) goto obj_val_end;
+    goto arr_val_end;
+
+doc_end:
+    if (unlikely(ip != idx + ntok)) goto fail; /* trailing garbage */
+    **pre = '\0';
+    doc = (yyjson_doc *)val_hdr;
+    doc->root = val_hdr + hdr_len;
+    doc->alc = alc;
+    doc->dat_read = (usize)(eof - hdr);
+    doc->val_read = (usize)((val - doc->root) + 1);
+    doc->str_pool = has_flg(INSITU) ? NULL : (char *)hdr;
+    return doc;
+
+fail:
+    alc.free(alc.ctx, val_hdr);
+    return NULL;
+#undef S1_NEXT
+#undef S1_SCALAR_END
+#undef S1_STR
+}
+
+/* 0: success (doc set), 1: fall back (buffer untouched), 2: fall back
+   (buffer modified), 3: memory error */
+static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
+                            yyjson_read_flag flg, yyjson_doc **doc_out) {
+    usize len = (usize)(eof - hdr), ntok = 0;
+    u32 *idx;
+    u64 *spc;
+    bool utf8_ok = false;
+    int ret;
+    idx = (u32 *)alc.malloc(alc.ctx, (len + 128) * sizeof(u32));
+    if (!idx) return 1; /* no memory for index: use regular reader */
+    spc = (u64 *)alc.malloc(alc.ctx, (len / 64 + 2) * sizeof(u64));
+    if (!spc) { alc.free(alc.ctx, idx); return 1; }
+    if (!s1_index(hdr, len, idx, spc, &ntok, &utf8_ok)) {
+        ret = 1;
+    } else {
+        bool oom = false;
+        *doc_out = s1_build(hdr, eof, idx, spc, ntok, alc, flg, &oom);
+        ret = *doc_out ? 0 : (oom ? 1 : 2);
+    }
+    alc.free(alc.ctx, spc);
+    alc.free(alc.ctx, idx);
+    return ret;
+}
+#endif /* YYJSON_DISABLE_STAGE1 */
+
 yyjson_doc *yyjson_read_opts(char *dat, usize len,
                              yyjson_read_flag flg,
                              const yyjson_alc *alc_ptr,
@@ -6415,6 +6976,30 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         }
     }
 
+#ifndef YYJSON_DISABLE_STAGE1
+#ifdef YYJSON_STAGE1_FORCE /* testing: route eligible reads to stage1 */
+    if (!(flg & ~YYJSON_READ_INSITU)) flg |= YYJSON_READ_STAGE1;
+#endif
+    if ((flg & YYJSON_READ_STAGE1) &&
+        !(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_INSITU)) &&
+        char_is_ctn(*cur) && len < (usize)0xFFFFFF00u) {
+        int s1r = s1_read(hdr, eof, alc, flg, &doc);
+        if (s1r == 0) {
+            memset(err, 0, sizeof(yyjson_read_err));
+            return doc;
+        }
+        if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
+        if (s1r == 2) {
+            if (has_flg(INSITU)) {
+                /* buffer already modified; report a generic error */
+                return_err(0, UNEXPECTED_CHARACTER,
+                           "invalid JSON (stage1 reader, insitu)");
+            }
+            memcpy(hdr, dat, len);
+            memset(eof, 0, YYJSON_PADDING_SIZE);
+        }
+    }
+#endif
     /* read json document */
     if (likely(char_is_ctn(*cur))) {
         if (char_is_space(cur[1]) && char_is_space(cur[2])) {
@@ -9013,14 +9598,14 @@ copy_ascii:
         byte_copy_16(cur, src);
         cur += 16; src += 16;
         while (end - src >= 32) {
-            __m256i v = _mm256_loadu_si256((const void *)src);
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
             __m256i m = _mm256_or_si256(
                 _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
                                 _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
                 _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
                                 _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v)));
             if (_mm256_movemask_epi8(m)) break;
-            _mm256_storeu_si256((void *)cur, v);
+            _mm256_storeu_si256((__m256i *)(void *)cur, v);
             cur += 32; src += 32;
         }
     }
