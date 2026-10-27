@@ -6973,6 +6973,174 @@ esc_again:
 
 #endif /* S1_AVX2 */
 
+#if !YYJSON_DISABLE_FAST_FP_CONV
+/*==============================================================================
+ * Stage-2 number fast path (simdjson / fast_float style SWAR digit parsing).
+ * Ported ideas: is_made_of_eight_digits_fast / parse_eight_digits_unrolled
+ * from simdjson (Apache-2.0/MIT). The binary conversion reuses yyjson's own
+ * correctly-rounded fast paths, so results are bit-identical; anything
+ * unusual (leading zero ints, >19 digits, long exponent, near-halfway cases,
+ * subnormal/overflow) returns false and the caller uses read_num().
+ *============================================================================*/
+static_inline u32 s1_digit_run(u64 v) { /* number of leading ASCII digits */
+    u64 x = v ^ U64(0x30303030, 0x30303030);
+    u64 d = ((x + U64(0x76767676, 0x76767676)) | x) & U64(0x80808080, 0x80808080);
+    return d ? (u32)(__builtin_ctzll(d) >> 3) : 8;
+}
+static_inline u64 s1_parse8(u64 v) { /* v: 8 bytes of 0..9 (byte 0 = MSD) */
+    v = (v * 10) + (v >> 8);
+    v = (((v & U64(0x000000FF, 0x000000FF)) * (100 + (U64(0x00000000, 0x000F4240) << 32))) +
+         (((v >> 16) & U64(0x000000FF, 0x000000FF)) * (1 + (U64(0x00000000, 0x00002710) << 32)))) >> 32;
+    return v;
+}
+static const u64 s1_pow10_u64[9] = {
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000
+};
+static const u64 s1_pow10_tab16[16] = {
+    U64(0x00000000, 0x00000001), U64(0x00000000, 0x0000000A), U64(0x00000000, 0x00000064), U64(0x00000000, 0x000003E8), U64(0x00000000, 0x00002710), U64(0x00000000, 0x000186A0), U64(0x00000000, 0x000F4240), U64(0x00000000, 0x00989680),
+    U64(0x00000000, 0x05F5E100), U64(0x00000000, 0x3B9ACA00), U64(0x00000002, 0x540BE400), U64(0x00000017, 0x4876E800),
+    U64(0x000000E8, 0xD4A51000), U64(0x00000918, 0x4E72A000), U64(0x00005AF3, 0x107A4000),
+    U64(0x00038D7E, 0xA4C68000)
+};
+#define s1_pow10_19(n) s1_pow10_tab16[n]
+static_inline u64 s1_val_n(u64 v, u32 n) { /* value of the first n digits */
+    u64 t = v - U64(0x30303030, 0x30303030);
+    t = n ? (t << ((64 - 8 * n) & 63)) : 0;
+    return s1_parse8(t);
+}
+static_inline bool s1_f64_conv(u64 sig, i32 exp, bool sign, yyjson_val *val) {
+    u64 raw, sig1, sig2, sig2_ext, hi, lo, hi2, lo2, add, bits;
+    i32 exp2;
+    u32 lz;
+    bool exact = false, carry, round_up;
+#if YYJSON_DOUBLE_MATH_CORRECT
+    if (sig < ((u64)1 << 53) &&
+        exp >= -F64_POW10_MAX_EXACT_EXP && exp <= +F64_POW10_MAX_EXACT_EXP) {
+        f64 dbl = (f64)sig;
+        if (exp < 0) dbl /= f64_pow10_table[-exp];
+        else dbl *= f64_pow10_table[+exp];
+        val->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
+        val->uni.f64 = sign ? -dbl : dbl;
+        return true;
+    }
+#endif
+    if (sig == 0) {
+        val->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
+        val->uni.u64 = (u64)sign << 63;
+        return true;
+    }
+    if (!(exp > -F64_MAX_DEC_EXP + 1 && exp < +F64_MAX_DEC_EXP - 20))
+        return false;
+    pow10_table_get_sig(exp, &sig2, &sig2_ext);
+    pow10_table_get_exp(exp, &exp2);
+    lz = u64_lz_bits(sig);
+    sig1 = sig << lz;
+    exp2 -= (i32)lz;
+    u128_mul(sig1, sig2, &hi, &lo);
+    bits = hi & (((u64)1 << (64 - 54 - 1)) - 1);
+    if (bits - 1 < (((u64)1 << (64 - 54 - 1)) - 2)) {
+        exact = true;
+    } else {
+        u128_mul(sig1, sig2_ext, &hi2, &lo2);
+        add = lo + hi2;
+        if (add + 1 > (u64)1) {
+            carry = add < lo || add < hi2;
+            hi += carry;
+            exact = true;
+        }
+    }
+    if (!exact) return false;
+    lz = hi < ((u64)1 << 63);
+    hi <<= lz;
+    exp2 -= (i32)lz;
+    exp2 += 64;
+    round_up = (hi & ((u64)1 << (64 - 54))) > (u64)0;
+    hi += (round_up ? ((u64)1 << (64 - 54)) : (u64)0);
+    if (hi < ((u64)1 << (64 - 54))) {
+        hi = ((u64)1 << 63);
+        exp2 += 1;
+    }
+    hi >>= F64_BITS - F64_SIG_FULL_BITS;
+    exp2 += F64_BITS - F64_SIG_FULL_BITS + F64_SIG_BITS;
+    exp2 += F64_EXP_BIAS;
+    raw = ((u64)exp2 << F64_SIG_BITS) | (hi & F64_SIG_MASK);
+    val->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
+    val->uni.u64 = ((u64)sign << 63) | raw;
+    return true;
+}
+
+/* Returns false to request the generic read_num (nothing is consumed). */
+static_inline bool s1_num(u8 **ptr, u8 *eof, yyjson_val *val) {
+    u8 *cur = *ptr;
+    bool sign = (*cur == '-');
+    u64 sig = 0;
+    u32 ni, nf = 0;
+    i32 exp = 0;
+    if (unlikely(eof - cur < 48)) return false; /* keep 8-byte loads in bounds */
+    cur += sign;
+    if (unlikely(*cur == '0')) {
+        if (cur[1] != '.') return false;   /* 0, -0, 0e5 ... */
+        ni = 1; cur++;
+    } else {
+        ni = 0;
+        while ((u8)(cur[ni] - '0') <= 9 && ni < 16) {
+            sig = sig * 10 + (u64)(cur[ni] - '0'); ni++;
+        }
+        cur += ni;
+        if (unlikely(ni == 0 || ni == 16)) return false;
+        if (likely(*cur != '.' && (*cur | 0x20) != 'e')) {
+            val->tag = YYJSON_TYPE_NUM | (u8)((u8)sign << 3);
+            val->uni.u64 = sign ? (u64)(~sig + 1) : sig;
+            *ptr = cur;
+            return true;
+        }
+    }
+    if (*cur == '.') {
+        u64 fv;
+        cur++;
+        {
+            u64 v1;
+            memcpy(&v1, cur, 8);
+            nf = s1_digit_run(v1);
+            fv = s1_val_n(v1, nf);
+            if (nf == 8) {
+                u64 v2, b;
+                u32 n2;
+                memcpy(&v2, cur + 8, 8);
+                n2 = s1_digit_run(v2);
+                b = s1_val_n(v2, n2);
+                fv = fv * s1_pow10_u64[n2] + b;
+                nf += n2;
+            }
+        }
+        cur += nf;
+        if (unlikely(nf == 0 || nf == 16 || ni + nf > 19)) return false;
+        sig = sig * s1_pow10_19(nf) + fv;
+        exp = -(i32)nf;
+    }
+    if ((*cur | 0x20) == 'e') {
+        bool es;
+        u32 e = 0, k = 0;
+        cur++;
+        es = (*cur == '-');
+        cur += (*cur == '-' || *cur == '+');
+        while (k < 4 && (u8)(cur[k] - '0') <= 9) { e = e * 10 + (u32)(cur[k] - '0'); k++; }
+        if (unlikely(k == 0 || k == 4)) return false;
+        cur += k;
+        exp += es ? -(i32)e : (i32)e;
+    }
+    if (unlikely(!s1_f64_conv(sig, exp, sign, val))) return false;
+    *ptr = cur;
+    return true;
+}
+#define S1_READ_NUM() do { \
+    if (!s1_num(&cur, eof, val) && \
+        unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail; } while (0)
+#else
+#define S1_READ_NUM() do { \
+    if (unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail; } while (0)
+#endif
+
 /* Stage 2. Returns NULL with *retry=true on any failure (caller falls back). */
 static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
                                      const u64 *spc, usize ntok,
@@ -7053,7 +7221,7 @@ arr_val_begin:
     if (*cur == '[') goto arr_begin;
     if (char_is_num(*cur)) {
         val++; ctn_len++;
-        if (unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail;
+        S1_READ_NUM();
         S1_SCALAR_END();
         goto arr_val_end;
     }
@@ -7127,7 +7295,7 @@ obj_val_begin:
     }
     if (char_is_num(*cur)) {
         val++; ctn_len++;
-        if (unlikely(!read_num(&cur, pre, flg, val, &msg))) goto fail;
+        S1_READ_NUM();
         S1_SCALAR_END();
         goto obj_val_end;
     }
