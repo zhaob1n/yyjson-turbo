@@ -6585,13 +6585,21 @@ static_inline void s1_utf8_block(s1_utf8 *u, const u8 *p, u64 hi) {
 #else
 #define S1_BARRIER(x)
 #endif
+/* scalar store the compiler cannot merge into vector inserts (clang SLP
+   turns simdjson-style unrolled index writes into slow vpinsrd chains) */
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+#define S1_STORE32(p, v) __asm__("movl %1, %0" : "=m"(*(p)) : "r"(v))
+#else
+#define S1_STORE32(p, v) (*(p) = (v))
+#endif
 
 static_inline u32 *s1_flatten(u32 *out, u32 base, u64 bits) {
     u32 n;
     if (!bits) return out;
     n = s1_popcnt(bits);
-#define S1_STEP(i) { u64 t_ = (u64)__builtin_ctzll(bits | ((u64)1 << 63)); \
-    S1_BARRIER(t_); out[i] = base + (u32)t_; bits &= bits - 1; }
+#define S1_STEP(i) { u32 t_ = base + (u32)__builtin_ctzll(bits | ((u64)1 << 63)); \
+    S1_STORE32(out + i, t_); bits &= bits - 1; }
     /* bits|1<<63 keeps ctz defined; extra slots are overwritten later */
     S1_STEP(0) S1_STEP(1) S1_STEP(2) S1_STEP(3)
     S1_STEP(4) S1_STEP(5) S1_STEP(6) S1_STEP(7)
@@ -6608,6 +6616,173 @@ static_inline u32 *s1_flatten(u32 *out, u32 base, u64 bits) {
     return out + n;
 }
 
+#if S1_AVX2
+/*------------------------------------------------------------------------------
+ * AVX2 stage 1, ported from simdjson (Apache-2.0 OR MIT, Copyright the
+ * simdjson authors): haswell json_character_block::classify (vpshufb nibble
+ * lookup), json_escape_scanner (odd-backslash sequences), json_string_scanner
+ * (clmul prefix-xor), json_scanner (scalar starts), bit_indexer (stepped
+ * popcount-guarded writes, previous block written while current is scanned)
+ * and utf8_lookup4. Adaptations for yyjson: closing quotes are also emitted,
+ * and a per-64-byte "special" mask (backslash | control) is stored so stage 2
+ * can take a no-escape fast path for strings.
+ *----------------------------------------------------------------------------*/
+#define S1_W4(i) S1_WI(i) S1_WI(i + 1) S1_WI(i + 2) S1_WI(i + 3)
+#define S1_WI(i) { S1_STORE32(out + (i), base + (u32)__builtin_ctzll(bits | ((u64)1 << 63))); \
+                   bits = bits & (bits - 1); }
+#if defined(__AVX512VBMI2__) && defined(__AVX512F__) && defined(__AVX512BW__)
+/* simdjson icelake bit_indexer::write (Apache-2.0 OR MIT, the simdjson
+   authors): vpcompressb a 0..63 byte iota, widen to u32, add base. */
+static_inline u32 *s1_write(u32 *out, u32 base, u64 bits) {
+    __m512i ix, b;
+    u32 cnt;
+    if (!bits) return out;
+    ix = _mm512_maskz_compress_epi8(bits, _mm512_set_epi32(
+        0x3f3e3d3c, 0x3b3a3938, 0x37363534, 0x33323130,
+        0x2f2e2d2c, 0x2b2a2928, 0x27262524, 0x23222120,
+        0x1f1e1d1c, 0x1b1a1918, 0x17161514, 0x13121110,
+        0x0f0e0d0c, 0x0b0a0908, 0x07060504, 0x03020100));
+    b = _mm512_set1_epi32((int)base);
+    cnt = s1_popcnt(bits);
+    _mm512_storeu_si512((void *)out, _mm512_add_epi32(
+        _mm512_cvtepu8_epi32(_mm512_castsi512_si128(ix)), b));
+    if (cnt > 16) {
+        _mm512_storeu_si512((void *)(out + 16), _mm512_add_epi32(
+            _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(ix, 1)), b));
+        if (cnt > 32) {
+            _mm512_storeu_si512((void *)(out + 32), _mm512_add_epi32(
+                _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(ix, 2)), b));
+            if (cnt > 48) {
+                _mm512_storeu_si512((void *)(out + 48), _mm512_add_epi32(
+                    _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(ix, 3)), b));
+            }
+        }
+    }
+    return out + cnt;
+}
+#else
+static_inline u32 *s1_write(u32 *out, u32 base, u64 bits) {
+    u32 cnt;
+    if (!bits) return out;
+    cnt = s1_popcnt(bits);
+    S1_W4(0)
+    if (likely(cnt > 4)) {
+        S1_W4(4)
+        if (cnt > 8) {
+            S1_W4(8)
+            if (unlikely(cnt > 12)) {
+                S1_W4(12)
+                if (unlikely(cnt > 16)) {
+                    S1_W4(16) S1_W4(20)
+                    if (unlikely(cnt > 24)) {
+                        u32 i;
+                        for (i = 24; i < cnt; i++) S1_WI(i)
+                    }
+                }
+            }
+        }
+    }
+    return out + cnt;
+}
+#undef S1_W4
+#undef S1_WI
+#endif
+
+typedef struct s1_st {
+    u64 next_esc, prev_in, prev_scalar;
+    s1_utf8 u;
+} s1_st;
+
+/* One 64-byte block: returns structural bits, stores the special mask. */
+static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
+    const __m256i wtab = S1_T16(' ', 100, 100, 100, 17, 100, 113, 2, 100,
+                                '\t', '\n', 112, 100, '\r', 100, 100);
+    const __m256i otab = S1_T16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                ':', '{', ',', '}', 0, 0);
+    const __m256i v20 = _mm256_set1_epi8(0x20), v1f = _mm256_set1_epi8(0x1F);
+    const __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
+    __m256i a, b;
+    u64 ws, op, qt, bs, ctrl, escaped, quote, in_str, scalar, nq, st;
+    a = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+    ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
+                _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(wtab, b)));
+    op = s1_mm2(_mm256_cmpeq_epi8(_mm256_or_si256(a, v20),
+                                  _mm256_shuffle_epi8(otab, a)),
+                _mm256_cmpeq_epi8(_mm256_or_si256(b, v20),
+                                  _mm256_shuffle_epi8(otab, b)));
+    qt = s1_mm2(_mm256_cmpeq_epi8(a, vq), _mm256_cmpeq_epi8(b, vq));
+    bs = s1_mm2(_mm256_cmpeq_epi8(a, vb), _mm256_cmpeq_epi8(b, vb));
+    ctrl = s1_mm2(_mm256_cmpeq_epi8(_mm256_min_epu8(a, v1f), a),
+                  _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
+    /* utf8_lookup4: skip pure-ASCII 64-byte blocks */
+    if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
+        s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
+        s->u.inc = _mm256_setzero_si256();
+        s->u.prev = b;
+    } else {
+        s1_utf8_step(&s->u, a);
+        s1_utf8_step(&s->u, b);
+    }
+    /* json_escape_scanner */
+    if (likely(!bs)) {
+        escaped = s->next_esc;
+        s->next_esc = 0;
+    } else {
+        u64 pe = bs & ~s->next_esc;
+        u64 ec = (((pe << 1) | S1_ODD) - pe) ^ S1_ODD;
+        escaped = ec ^ (bs | s->next_esc);
+        s->next_esc = (ec & bs) >> 63;
+    }
+    /* json_string_scanner */
+    quote = qt & ~escaped;
+    in_str = s1_prefix_xor(quote) ^ s->prev_in;
+    s->prev_in = (u64)((i64)in_str >> 63);
+    /* json_scanner */
+    scalar = ~(op | ws);
+    nq = scalar & ~quote;
+    st = (op | (scalar & ~((nq << 1) | s->prev_scalar))) & ~(in_str ^ quote);
+    s->prev_scalar = nq >> 63;
+    st |= quote & ~in_str; /* yyjson: closing quotes too */
+    *spc = bs | ctrl;
+    return st;
+}
+
+static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+                              usize *ntok, bool *utf8_ok) {
+    s1_st s;
+    u64 prev_st = 0, st;
+    u32 prev_base = 0;
+    u32 *out = idx;
+    usize pos = 0, blk = 0, full = len & ~(usize)63;
+    u8 tmp[64];
+    s.next_esc = s.prev_in = s.prev_scalar = 0;
+    s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
+    for (; pos < full; pos += 64, blk++) {
+        st = s1_block(buf + pos, &s, spc + blk);
+        /* bit_indexer: write previous block while this one is in flight */
+        out = s1_write(out, prev_base, prev_st);
+        prev_st = st;
+        prev_base = (u32)pos;
+    }
+    if (pos < len) {
+        memset(tmp, ' ', 64);
+        memcpy(tmp, buf + pos, len - pos);
+        st = s1_block(tmp, &s, spc + blk);
+        out = s1_write(out, prev_base, prev_st);
+        prev_st = st;
+        prev_base = (u32)pos;
+    }
+    out = s1_write(out, prev_base, prev_st);
+    if (s.prev_in) return false;
+    s.u.err = _mm256_or_si256(s.u.err, s.u.inc);
+    *utf8_ok = _mm256_testz_si256(s.u.err, s.u.err) != 0;
+    if (!*utf8_ok) return false;
+    *ntok = (usize)(out - idx);
+    out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
+    return true;
+}
+#else
 /* Build structural index. Returns false if the regular reader must be used
    (unclosed string or invalid UTF-8). Nothing in `buf` is modified. */
 static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
@@ -6670,6 +6845,7 @@ static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
     out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
     return true;
 }
+#endif /* S1_AVX2 */
 
 static_inline bool s1_has_spc(const u64 *spc, usize a, usize b) {
     usize wa, wb, w;
