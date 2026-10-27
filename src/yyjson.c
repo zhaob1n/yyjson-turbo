@@ -6567,9 +6567,9 @@ static_inline void s1_utf8_step(s1_utf8 *u, __m256i in) {
 
 #if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
 #define S1_Z 1
-typedef struct s1_utf8z {
-    __m512i prev, err, inc;
-} s1_utf8z;
+#ifndef S1_ZUTF8_MIN
+#define S1_ZUTF8_MIN 64 /* non-ASCII blocks before switching to zmm UTF-8 */
+#endif
 #define S1_ZB(t) _mm512_broadcast_i32x4(_mm256_castsi256_si128(t))
 static_inline __m512i s1_prevnz(__m512i in, __m512i prev, int n) {
     __m512i t = _mm512_alignr_epi64(in, prev, 6);
@@ -6579,9 +6579,11 @@ static_inline __m512i s1_prevnz(__m512i in, __m512i prev, int n) {
         default: return _mm512_alignr_epi8(in, t, 13);
     }
 }
-static_inline void s1_utf8_stepz(s1_utf8z *u, __m512i in) {
+/* zmm step with ymm state: zmm is only touched on non-ASCII blocks */
+static_inline void s1_utf8_stepz(s1_utf8 *u, __m512i in) {
     const __m512i nib = _mm512_set1_epi8(0x0F);
-    __m512i prev1 = s1_prevnz(in, u->prev, 1);
+    const __m512i pz = _mm512_inserti64x4(_mm512_setzero_si512(), u->prev, 1);
+    __m512i prev1 = s1_prevnz(in, pz, 1);
     __m256i t1h_ = S1_T16(
         S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
         S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG, S1_TOO_LONG,
@@ -6626,21 +6628,23 @@ static_inline void s1_utf8_stepz(s1_utf8z *u, __m512i in) {
         _mm512_and_si512(_mm512_shuffle_epi8(t1h, p1h),
                          _mm512_shuffle_epi8(t1l, p1l)),
         _mm512_shuffle_epi8(t2h, inh));
-    __m512i prev2 = s1_prevnz(in, u->prev, 2);
-    __m512i prev3 = s1_prevnz(in, u->prev, 3);
+    __m512i prev2 = s1_prevnz(in, pz, 2);
+    __m512i prev3 = s1_prevnz(in, pz, 3);
     __m512i is3 = _mm512_subs_epu8(prev2, _mm512_set1_epi8((char)(0xE0 - 0x80)));
     __m512i is4 = _mm512_subs_epu8(prev3, _mm512_set1_epi8((char)(0xF0 - 0x80)));
     __m512i must = _mm512_and_si512(_mm512_or_si512(is3, is4),
                                     _mm512_set1_epi8((char)0x80));
-    u->err = _mm512_or_si512(u->err, _mm512_xor_si512(must, sc));
+    __m512i e = _mm512_xor_si512(must, sc);
+    u->err = _mm256_or_si256(u->err, _mm256_or_si256(
+        _mm512_castsi512_si256(e), _mm512_extracti64x4_epi64(e, 1)));
     {
         const __m512i mx = _mm512_inserti64x4(_mm512_set1_epi8(-1), _mm256_setr_epi8(
             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
             (char)(0xF0 - 1), (char)(0xE0 - 1), (char)(0xC0 - 1)), 1);
-        u->inc = _mm512_subs_epu8(in, mx);
+        u->inc = _mm512_extracti64x4_epi64(_mm512_subs_epu8(in, mx), 1);
     }
-    u->prev = in;
+    u->prev = _mm512_extracti64x4_epi64(in, 1);
 }
 
 #else
@@ -6771,11 +6775,8 @@ static_inline u32 *s1_write(u32 *out, u32 base, u64 bits) {
 
 typedef struct s1_st {
     u64 next_esc, prev_in, prev_scalar;
-#if S1_Z
-    s1_utf8z u;
-#else
     s1_utf8 u;
-#endif
+    usize nna;
 } s1_st;
 
 /* One 64-byte block: returns structural bits, stores the special mask. */
@@ -6802,11 +6803,16 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
         ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
         (void)v20; (void)v1f; (void)vq; (void)vb; (void)a; (void)b;
         if (likely(!_mm512_movepi8_mask(z))) {
-            s->u.err = _mm512_or_si512(s->u.err, s->u.inc);
-            s->u.inc = _mm512_setzero_si512();
-            s->u.prev = z;
-        } else {
+            s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
+            s->u.inc = _mm256_setzero_si256();
+            s->u.prev = _mm512_extracti64x4_epi64(z, 1);
+        } else if (s->nna >= S1_ZUTF8_MIN) {
             s1_utf8_stepz(&s->u, z);
+        } else {
+            /* few non-ASCII blocks: ymm steps avoid zmm license stalls */
+            s->nna++;
+            s1_utf8_step(&s->u, _mm512_castsi512_si256(z));
+            s1_utf8_step(&s->u, _mm512_extracti64x4_epi64(z, 1));
         }
     }
 #else
@@ -6869,11 +6875,8 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     usize pos = 0, blk = 0, full = len & ~(usize)63;
     u8 tmp[64];
     s.next_esc = s.prev_in = s.prev_scalar = 0;
-#if S1_Z
-    s.u.prev = s.u.err = s.u.inc = _mm512_setzero_si512();
-#else
     s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
-#endif
+    s.nna = 0;
     for (; pos < full; pos += 64, blk++) {
         st = s1_block(buf + pos, dst != buf ? dst + pos : NULL, &s, spc + blk);
         /* bit_indexer: write previous block while this one is in flight */
@@ -6892,12 +6895,15 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     }
     out = s1_write(out, prev_base, prev_st);
     if (s.prev_in) return false;
-#if S1_Z
-    s.u.err = _mm512_or_si512(s.u.err, s.u.inc);
-    *utf8_ok = _mm512_test_epi8_mask(s.u.err, s.u.err) == 0;
-#else
     s.u.err = _mm256_or_si256(s.u.err, s.u.inc);
     *utf8_ok = _mm256_testz_si256(s.u.err, s.u.err) != 0;
+#if S1_Z && (defined(__GNUC__) || defined(__clang__))
+    /* vzeroupper does not clean zmm16-31: dirty upper state there keeps the
+       core in the AVX-512 frequency license for the whole stage 2 */
+    __asm__ __volatile__("vpxord %%xmm16, %%xmm16, %%xmm16\n\t""vpxord %%xmm17, %%xmm17, %%xmm17\n\t""vpxord %%xmm18, %%xmm18, %%xmm18\n\t""vpxord %%xmm19, %%xmm19, %%xmm19\n\t""vpxord %%xmm20, %%xmm20, %%xmm20\n\t""vpxord %%xmm21, %%xmm21, %%xmm21\n\t""vpxord %%xmm22, %%xmm22, %%xmm22\n\t""vpxord %%xmm23, %%xmm23, %%xmm23\n\t"
+        ::: "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23");
+    __asm__ __volatile__("vpxord %%xmm24, %%xmm24, %%xmm24\n\t""vpxord %%xmm25, %%xmm25, %%xmm25\n\t""vpxord %%xmm26, %%xmm26, %%xmm26\n\t""vpxord %%xmm27, %%xmm27, %%xmm27\n\t""vpxord %%xmm28, %%xmm28, %%xmm28\n\t""vpxord %%xmm29, %%xmm29, %%xmm29\n\t""vpxord %%xmm30, %%xmm30, %%xmm30\n\t""vpxord %%xmm31, %%xmm31, %%xmm31\n\t"
+        ::: "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29", "xmm30", "xmm31");
 #endif
     if (!*utf8_ok) return false;
     *ntok = (usize)(out - idx);
