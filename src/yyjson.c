@@ -6694,7 +6694,7 @@ typedef struct s1_st {
 } s1_st;
 
 /* One 64-byte block: returns structural bits, stores the special mask. */
-static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
+static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
     const __m256i wtab = S1_T16(' ', 100, 100, 100, 17, 100, 113, 2, 100,
                                 '\t', '\n', 112, 100, '\r', 100, 100);
     const __m256i otab = S1_T16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -6706,6 +6706,7 @@ static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
 #if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
     {   /* 64-byte classify as in simdjson icelake (one zmm per block) */
         const __m512i z = _mm512_loadu_si512((const void *)p);
+        _mm512_storeu_si512((void *)d, z); /* fused input copy */
         const __m512i wt = _mm512_broadcast_i32x4(_mm256_castsi256_si128(wtab));
         const __m512i ot = _mm512_broadcast_i32x4(_mm256_castsi256_si128(otab));
         ws = _mm512_cmpeq_epi8_mask(z, _mm512_shuffle_epi8(wt, z));
@@ -6721,6 +6722,8 @@ static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
 #else
     a = _mm256_loadu_si256((const __m256i *)(const void *)p);
     b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+    _mm256_storeu_si256((__m256i *)(void *)d, a); /* fused input copy */
+    _mm256_storeu_si256((__m256i *)(void *)(d + 32), b);
     ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
                 _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(wtab, b)));
     op = s1_mm2(_mm256_cmpeq_epi8(_mm256_or_si256(a, v20),
@@ -6765,8 +6768,8 @@ static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
     return st;
 }
 
-static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
-                              usize *ntok, bool *utf8_ok) {
+static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
+                              u64 *spc, usize *ntok, bool *utf8_ok) {
     s1_st s;
     u64 prev_st = 0, st;
     u32 prev_base = 0;
@@ -6776,7 +6779,7 @@ static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
     s.next_esc = s.prev_in = s.prev_scalar = 0;
     s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
     for (; pos < full; pos += 64, blk++) {
-        st = s1_block(buf + pos, &s, spc + blk);
+        st = s1_block(buf + pos, dst + pos, &s, spc + blk);
         /* bit_indexer: write previous block while this one is in flight */
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
@@ -6785,7 +6788,8 @@ static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
     if (pos < len) {
         memset(tmp, ' ', 64);
         memcpy(tmp, buf + pos, len - pos);
-        st = s1_block(tmp, &s, spc + blk);
+        st = s1_block(tmp, tmp, &s, spc + blk);
+        if (dst != buf) memcpy(dst + pos, buf + pos, len - pos);
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
         prev_base = (u32)pos;
@@ -6802,8 +6806,8 @@ static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
 #else
 /* Build structural index. Returns false if the regular reader must be used
    (unclosed string or invalid UTF-8). Nothing in `buf` is modified. */
-static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
-                              usize *ntok, bool *utf8_ok) {
+static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
+                              u64 *spc, usize *ntok, bool *utf8_ok) {
     u64 prev_esc = 0, prev_in = 0, prev_scalar = 0;
     u32 *out = idx;
     usize pos;
@@ -6812,6 +6816,7 @@ static_noinline bool s1_index(const u8 *buf, usize len, u32 *idx, u64 *spc,
     s1_utf8 u;
     u.prev = u.err = u.inc = _mm256_setzero_si256();
 #endif
+    if (dst != buf) memcpy(dst, buf, len);
     for (pos = 0; pos < len; pos += 64) {
         const u8 *p = buf + pos;
         s1_masks m;
@@ -7084,9 +7089,11 @@ fail:
 }
 
 /* 0: success (doc set), 1: fall back (buffer untouched), 2: fall back
-   (buffer modified), 3: memory error */
+   (buffer modified), 3: memory error. `src` is copied into `hdr` while
+   indexing (src == hdr for insitu); on fallback the copy may be partial. */
 static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
-                            yyjson_read_flag flg, yyjson_doc **doc_out) {
+                            yyjson_read_flag flg, yyjson_doc **doc_out,
+                            const u8 *src) {
     usize len = (usize)(eof - hdr), ntok = 0;
     u32 *idx;
     u64 *spc;
@@ -7096,7 +7103,7 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
     if (!idx) return 1; /* no memory for index: use regular reader */
     spc = (u64 *)alc.malloc(alc.ctx, (len / 64 + 2) * sizeof(u64));
     if (!spc) { alc.free(alc.ctx, idx); return 1; }
-    if (!s1_index(hdr, len, idx, spc, &ntok, &utf8_ok)) {
+    if (!s1_index(src, hdr, len, idx, spc, &ntok, &utf8_ok)) {
         ret = 1;
     } else {
         bool oom = false;
@@ -7131,6 +7138,10 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     if (unlikely(!dat)) return_err(0, INVALID_PARAMETER, "input data is NULL");
     if (unlikely(!len)) return_err(0, INVALID_PARAMETER, "input length is 0");
 
+#if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
+    /* testing: route eligible reads to stage1 */
+    if (!(flg & ~YYJSON_READ_INSITU)) flg |= YYJSON_READ_STAGE1;
+#endif
     /* add 4-byte zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         hdr = (u8 *)dat;
@@ -7146,6 +7157,22 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         }
         eof = hdr + len;
         cur = hdr;
+#ifndef YYJSON_DISABLE_STAGE1
+        /* stage1 fuses the input copy into its indexing pass */
+        if ((flg & YYJSON_READ_STAGE1) &&
+            !(flg & ~YYJSON_READ_STAGE1) &&
+            char_is_ctn(*(const u8 *)dat) && len < (usize)0xFFFFFF00u) {
+            int s1r;
+            memset(eof, 0, YYJSON_PADDING_SIZE);
+            s1r = s1_read(hdr, eof, alc, flg, &doc, (const u8 *)dat);
+            if (s1r == 0) {
+                memset(err, 0, sizeof(yyjson_read_err));
+                return doc;
+            }
+            if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
+            flg &= ~YYJSON_READ_STAGE1; /* fall back to the regular reader */
+        }
+#endif
         memcpy(hdr, dat, len);
     }
     memset(eof, 0, YYJSON_PADDING_SIZE);
@@ -7170,13 +7197,10 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     }
 
 #ifndef YYJSON_DISABLE_STAGE1
-#ifdef YYJSON_STAGE1_FORCE /* testing: route eligible reads to stage1 */
-    if (!(flg & ~YYJSON_READ_INSITU)) flg |= YYJSON_READ_STAGE1;
-#endif
     if ((flg & YYJSON_READ_STAGE1) &&
         !(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_INSITU)) &&
         char_is_ctn(*cur) && len < (usize)0xFFFFFF00u) {
-        int s1r = s1_read(hdr, eof, alc, flg, &doc);
+        int s1r = s1_read(hdr, eof, alc, flg, &doc, hdr);
         if (s1r == 0) {
             memset(err, 0, sizeof(yyjson_read_err));
             return doc;
