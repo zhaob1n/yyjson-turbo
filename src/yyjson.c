@@ -6703,6 +6703,22 @@ static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
     const __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
     __m256i a, b;
     u64 ws, op, qt, bs, ctrl, escaped, quote, in_str, scalar, nq, st;
+#if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
+    {   /* 64-byte classify as in simdjson icelake (one zmm per block) */
+        const __m512i z = _mm512_loadu_si512((const void *)p);
+        const __m512i wt = _mm512_broadcast_i32x4(_mm256_castsi256_si128(wtab));
+        const __m512i ot = _mm512_broadcast_i32x4(_mm256_castsi256_si128(otab));
+        ws = _mm512_cmpeq_epi8_mask(z, _mm512_shuffle_epi8(wt, z));
+        op = _mm512_cmpeq_epi8_mask(_mm512_or_si512(z, _mm512_set1_epi8(0x20)),
+                                    _mm512_shuffle_epi8(ot, z));
+        qt = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('"'));
+        bs = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('\\'));
+        ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
+        a = _mm512_castsi512_si256(z);
+        b = _mm512_extracti64x4_epi64(z, 1);
+        (void)v20; (void)v1f; (void)vq; (void)vb;
+    }
+#else
     a = _mm256_loadu_si256((const __m256i *)(const void *)p);
     b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
     ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
@@ -6715,6 +6731,7 @@ static_inline u64 s1_block(const u8 *p, s1_st *s, u64 *spc) {
     bs = s1_mm2(_mm256_cmpeq_epi8(a, vb), _mm256_cmpeq_epi8(b, vb));
     ctrl = s1_mm2(_mm256_cmpeq_epi8(_mm256_min_epu8(a, v1f), a),
                   _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
+#endif
     /* utf8_lookup4: skip pure-ASCII 64-byte blocks */
     if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
         s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
