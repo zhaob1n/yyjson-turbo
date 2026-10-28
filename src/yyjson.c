@@ -7052,10 +7052,13 @@ static_inline bool s1_u4_bmp3(const u8 *src, u8 *dst) {
 
 /* Unescape a string whose special bytes (backslash / control) are known from
    the stage-1 `spc` bitmap: copy runs between them with vector moves instead
-   of yyjson's per-byte loop. Returns false on any error (caller falls back). */
-static_noinline bool s1_str_esc(u8 *hdr, u8 *s_beg, u8 *s_end,
-                                const u64 *spc, yyjson_val *val) {
-    u8 *src = s_beg, *dst = s_beg;
+   of yyjson's per-byte loop. The result is written to `out`, which is either
+   `s_beg` (in place) or a separate string pool (YYJSON_READ_NO_NUL_TERM; up
+   to 4 bytes past the result may be written). Returns the position of the
+   written NUL terminator, or NULL on any error (caller falls back). */
+static_noinline u8 *s1_str_esc(u8 *hdr, u8 *s_beg, u8 *s_end,
+                               const u64 *spc, yyjson_val *val, u8 *out) {
+    u8 *src = s_beg, *dst = out;
     usize end = (usize)(s_end - hdr), pos = (usize)(s_beg - hdr), w, p, n;
     const char *msg;
     u64 m;
@@ -7084,7 +7087,7 @@ found:
             dst += n; src += n;
         }
         if (p == end) break;
-        if (*src != '\\') return false; /* control char */
+        if (*src != '\\') return NULL; /* control char */
 esc_again:
         switch (src[1]) {
             case '"':  *dst++ = '"';  src += 2; break;
@@ -7108,7 +7111,7 @@ esc_again:
                     }
                     if (unlikely(!hex_load_4(src + 2, &ux) ||
                                  (ux & 0xF800) == 0xD800)) {
-                        if (!read_uni_esc(&src, &dst, &msg)) return false;
+                        if (!read_uni_esc(&src, &dst, &msg)) return NULL;
                         break;
                     }
                     if (ux >= 0x800) {
@@ -7128,9 +7131,9 @@ esc_again:
                 }
 u_done:
                 break;
-            default: return false;
+            default: return NULL;
         }
-        if (src > s_end) return false;
+        if (src > s_end) return NULL;
         if (*src == '\\' && src < s_end) goto esc_again; /* escape runs */
         pos = (usize)(src - hdr);
         if ((pos >> 6) == w) {
@@ -7140,10 +7143,10 @@ u_done:
             m = spc[w] & (~(u64)0 << (pos & 63));
         }
     }
-    val->tag = ((u64)(dst - s_beg) << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
-    val->uni.str = (const char *)s_beg;
+    val->tag = ((u64)(dst - out) << YYJSON_TAG_BIT) | YYJSON_TYPE_STR;
+    val->uni.str = (const char *)out;
     *dst = '\0';
-    return true;
+    return dst;
 }
 
 #endif /* S1_AVX2 */
@@ -7320,7 +7323,7 @@ static_inline bool s1_num(u8 **ptr, u8 *eof, yyjson_val *val) {
 static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
                                      const u64 *spc, usize ntok,
                                      yyjson_alc alc, yyjson_read_flag flg,
-                                     bool *oom) {
+                                     bool nonul, bool *oom) {
     usize hdr_len, alc_len, ctn_len;
     yyjson_val *val_hdr, *val, *ctn, *ctn_parent;
     yyjson_doc *doc;
@@ -7330,6 +7333,10 @@ static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
     u8 raw_end[1];
     u8 *raw_ptr = raw_end;
     u8 **pre = &raw_ptr;
+    /* NO_NUL_TERM: `hdr` is the caller's const input and is never written;
+       escaped strings are decoded into `pool` (allocated on first use). */
+    u8 *pool = NULL, *pool_cur = NULL;
+    usize len = (usize)(eof - hdr);
 
     hdr_len = sizeof(yyjson_doc) / sizeof(yyjson_val);
     hdr_len += (sizeof(yyjson_doc) % sizeof(yyjson_val)) > 0;
@@ -7345,21 +7352,46 @@ static_noinline yyjson_doc *s1_build(u8 *hdr, u8 *eof, const u32 *idx,
     if (unlikely(cur != nxt && !char_is_space(*cur))) goto fail; } while (0)
 #if S1_AVX2 /* spc = backslash|ctrl; UTF-8 already validated */
 #define S1_STR_ESC() do { \
-    if (unlikely(!s1_str_esc(hdr, s_beg, s_end, spc, val))) goto fail; \
-    } while (0)
+    if (!nonul) { \
+        if (unlikely(!s1_str_esc(hdr, s_beg, s_end, spc, val, s_beg))) \
+            goto fail; \
+    } else { \
+        S1_POOL(); \
+        pool_cur = s1_str_esc(hdr, s_beg, s_end, spc, val, pool_cur); \
+        if (unlikely(!pool_cur)) goto fail; \
+        pool_cur++; \
+    } } while (0)
 #else /* spc also marks non-ASCII: let read_str validate UTF-8 */
 #define S1_STR_ESC() do { \
-    if (unlikely(!read_str(&cur, eof, flg, val, &msg))) goto fail; \
-    if (unlikely(cur != s_end + 1)) goto fail; \
-    } while (0)
+    if (!nonul) { \
+        if (unlikely(!read_str(&cur, eof, flg, val, &msg))) goto fail; \
+        if (unlikely(cur != s_end + 1)) goto fail; \
+    } else { /* copy the raw string (with quotes) and unescape it there */ \
+        usize rl = (usize)(s_end - cur) + 1; \
+        u8 *pc; \
+        S1_POOL(); \
+        memcpy(pool_cur, cur, rl); \
+        memset(pool_cur + rl, 0, YYJSON_PADDING_SIZE); \
+        pc = pool_cur; \
+        if (unlikely(!read_str(&pc, pool_cur + rl, flg, val, &msg))) \
+            goto fail; \
+        if (unlikely(pc != pool_cur + rl)) goto fail; \
+        pool_cur = pc; \
+    } } while (0)
 #endif
+/* every escaped string needs at most its raw length (quotes included) plus
+   4 bytes of slack, so `len + 64` bytes always suffice */
+#define S1_POOL() do { if (!pool) { \
+    pool = (u8 *)alc.malloc(alc.ctx, len + 64); \
+    if (unlikely(!pool)) { *oom = true; goto fail; } \
+    pool_cur = pool; } } while (0)
 #define S1_STR() do { \
     u8 *s_beg = cur + 1, *s_end = hdr + *ip++; \
     if (likely(!s1_has_spc(spc, (usize)(s_beg - hdr), (usize)(s_end - hdr)))) { \
         val->tag = ((u64)(s_end - s_beg) << YYJSON_TAG_BIT) | \
                    YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC; \
         val->uni.str = (const char *)s_beg; \
-        *s_end = '\0'; \
+        if (!nonul) *s_end = '\0'; \
     } else { \
         S1_STR_ESC(); \
     } } while (0)
@@ -7520,21 +7552,53 @@ doc_end:
     doc->alc = alc;
     doc->dat_read = (usize)(eof - hdr);
     doc->val_read = (usize)((val - doc->root) + 1);
-    doc->str_pool = has_flg(INSITU) ? NULL : (char *)hdr;
+    doc->str_pool = has_flg(INSITU) ? NULL :
+                    nonul ? (char *)pool : (char *)hdr;
     return doc;
 
 fail:
+    if (pool) alc.free(alc.ctx, pool);
     alc.free(alc.ctx, val_hdr);
     return NULL;
 #undef S1_NEXT
 #undef S1_SCALAR_END
 #undef S1_STR
 #undef S1_STR_ESC
+#undef S1_POOL
+}
+
+/* NO_NUL_TERM: the byte at `hdr + len` is caller memory, not a NUL, so the
+   end-of-index sentinels must point at an input byte that every stage-2
+   dispatch rejects (anything but structural, quote, number or literal start
+   characters). Such a byte is found within the first few bytes of nearly any
+   document. Returns false (use the regular reader) if there is none or if the
+   last token is not a closing bracket (the document is invalid then). */
+static_inline bool s1_sentinel(const u8 *hdr, usize len, u32 *sen,
+                               usize ntok) {
+    usize i;
+    u8 last;
+    /* the last token must close the root: then every scalar has a following
+       token inside the input, so number and literal parsing stop before the
+       end of the input (the padding content is arbitrary) */
+    if (!ntok) return false;
+    last = hdr[sen[-1]];
+    if (last != ']' && last != '}') return false;
+    for (i = 0; i < len; i++) {
+        u8 c = hdr[i];
+        if (c == '"' || c == '{' || c == '}' || c == '[' || c == ']' ||
+            c == ',' || c == ':' || c == '-' || (u8)(c - '0') <= 9 ||
+            c == 't' || c == 'f' || c == 'n') continue;
+        sen[0] = sen[1] = sen[2] = sen[3] = (u32)i;
+        return true;
+    }
+    return false;
 }
 
 /* 0: success (doc set), 1: fall back (buffer untouched), 2: fall back
    (buffer modified), 3: memory error. `src` is copied into `hdr` while
-   indexing (src == hdr for insitu); on fallback the copy may be partial. */
+   indexing (src == hdr for insitu); on fallback the copy may be partial.
+   With YYJSON_READ_NO_NUL_TERM, src == hdr is the caller's const input,
+   which is only read (never 2). */
 static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
                             yyjson_read_flag flg, yyjson_doc **doc_out,
                             const u8 *src) {
@@ -7550,14 +7614,18 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
 #ifdef YYJSON_S1_PROF
     { extern u64 s1_prof_t[4]; u64 t0 = __rdtsc();
 #endif
-    if (!s1_index(src, hdr, len, idx, spc, &ntok, &utf8_ok)) {
+    if (!s1_index(src, hdr, len, idx, spc, &ntok, &utf8_ok) ||
+        ((flg & YYJSON_READ_NO_NUL_TERM) &&
+         !s1_sentinel(hdr, len, idx + ntok, ntok))) {
         ret = 1;
     } else {
         bool oom = false;
 #ifdef YYJSON_S1_PROF
         u64 t1 = __rdtsc(); s1_prof_t[0] += t1 - t0; t0 = t1;
 #endif
-        *doc_out = s1_build(hdr, eof, idx, spc, ntok, alc, flg, &oom);
+        *doc_out = s1_build(hdr, eof, idx, spc, ntok, alc,
+                            flg & ~YYJSON_READ_NO_NUL_TERM,
+                            (flg & YYJSON_READ_NO_NUL_TERM) != 0, &oom);
 #ifdef YYJSON_S1_PROF
         s1_prof_t[1] += __rdtsc() - t0; s1_prof_t[2] += ntok;
 #endif
@@ -7596,8 +7664,27 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
 
 #if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
     /* testing: route eligible reads to stage1 */
-    if (!(flg & ~YYJSON_READ_INSITU)) flg |= YYJSON_READ_STAGE1;
+    if (!(flg & ~(YYJSON_READ_INSITU | YYJSON_READ_NO_NUL_TERM)))
+        flg |= YYJSON_READ_STAGE1;
 #endif
+    if (flg & YYJSON_READ_NO_NUL_TERM) {
+#ifndef YYJSON_DISABLE_STAGE1
+        /* zero-copy: build directly on the const input (never written) */
+        if ((flg & YYJSON_READ_STAGE1) &&
+            !(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM)) &&
+            char_is_ctn(*(const u8 *)dat) && len < (usize)0xFFFFFF00u) {
+            int s1r = s1_read((u8 *)dat, (u8 *)dat + len, alc, flg, &doc,
+                              (const u8 *)dat);
+            if (s1r == 0) {
+                memset(err, 0, sizeof(yyjson_read_err));
+                return doc;
+            }
+            if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
+            flg &= ~YYJSON_READ_STAGE1; /* fall back to the regular reader */
+        }
+#endif
+        flg &= ~YYJSON_READ_NO_NUL_TERM;
+    }
     /* add 4-byte zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         hdr = (u8 *)dat;

@@ -898,6 +898,41 @@ static const yyjson_read_flag YYJSON_READ_ALLOW_UNQUOTED_KEY        = 1 << 13;
     The produced DOM is identical to the regular reader. */
 static const yyjson_read_flag YYJSON_READ_STAGE1                    = 1 << 15;
 
+/** Zero-copy strings for the two-stage reader (use with YYJSON_READ_STAGE1).
+
+    Without YYJSON_READ_INSITU, the reader normally copies the whole input
+    into a new buffer so that it can NUL-terminate strings in place. With this
+    flag, the two-stage reader skips that copy and builds the document
+    directly on the caller's input, which is never modified:
+    - Strings without escapes point into the input buffer and are NOT
+      NUL-terminated; always use the string length (`yyjson_get_len()`).
+    - Strings with escapes are decoded into a separate string pool owned by
+      the document (these happen to be NUL-terminated, but do not rely on it).
+
+    Requirements:
+    - The input buffer must stay valid and unmodified until the document is
+      freed with `yyjson_doc_free()`.
+    - At least `YYJSON_PADDING_SIZE` bytes after `len` must be readable
+      (their content does not matter and is never written). Inputs read from
+      a plain `malloc(len)` buffer may not satisfy this; allocate `len +
+      YYJSON_PADDING_SIZE` bytes instead.
+
+    APIs that are safe with this flag (they use the stored length): the
+    writer (`yyjson_write()`, `yyjson_val_write()`, ...), `yyjson_get_len()`,
+    `yyjson_equals_str()`, `yyjson_equals_strn()`, object key lookup
+    (`yyjson_obj_get()`, `yyjson_obj_getn()`, iterators), JSON Pointer,
+    `yyjson_val_mut_copy()` / `yyjson_doc_mut_copy()` and all other library
+    functions. Unsafe: treating `yyjson_get_str()`, `unsafe_yyjson_get_str()`
+    or iterator keys as C strings (`strlen()`, `strcmp()`, `printf("%s")`,
+    ...). Copy the string with its length first if a C string is needed.
+
+    The flag is ignored (normal NUL-terminated strings are produced) when
+    YYJSON_READ_INSITU is set, when YYJSON_READ_STAGE1 is not set, when any
+    other flag is set, when the root is not an array or object, or when the
+    two-stage reader falls back to the regular reader (e.g. invalid JSON).
+    Check `yyjson_doc_get_read_size()` or simply always use lengths. */
+static const yyjson_read_flag YYJSON_READ_NO_NUL_TERM               = 1 << 16;
+
 /** Allow JSON5 format, see: [https://json5.org].
     This flag supports all JSON5 features with some additional extensions:
     - Accepts more escape sequences than JSON5 (e.g. `\a`, `\e`).
