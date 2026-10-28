@@ -6777,6 +6777,7 @@ typedef struct s1_st {
     u64 next_esc, prev_in, prev_scalar;
     s1_utf8 u;
     usize nna;
+    u32 dirty; /* last block was non-ASCII: UTF-8 carry state is live */
 } s1_st;
 
 /* One 64-byte block: returns structural bits, stores the special mask. */
@@ -6803,13 +6804,20 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
         ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
         (void)v20; (void)v1f; (void)vq; (void)vb; (void)a; (void)b;
         if (likely(!_mm512_movepi8_mask(z))) {
-            s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
-            s->u.inc = _mm256_setzero_si256();
-            s->u.prev = _mm512_extracti64x4_epi64(z, 1);
+            /* ASCII block: flush the UTF-8 carry once after non-ASCII input;
+               an all-zero prev is equivalent to any ASCII prev */
+            if (unlikely(s->dirty)) {
+                s->dirty = 0;
+                s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
+                s->u.inc = _mm256_setzero_si256();
+                s->u.prev = _mm256_setzero_si256();
+            }
         } else if (s->nna >= S1_ZUTF8_MIN) {
+            s->dirty = 1;
             s1_utf8_stepz(&s->u, z);
         } else {
             /* few non-ASCII blocks: ymm steps avoid zmm license stalls */
+            s->dirty = 1;
             s->nna++;
             s1_utf8_step(&s->u, _mm512_castsi512_si256(z));
             s1_utf8_step(&s->u, _mm512_extracti64x4_epi64(z, 1));
@@ -6834,10 +6842,14 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
                   _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
     /* utf8_lookup4: skip pure-ASCII 64-byte blocks */
     if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
-        s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
-        s->u.inc = _mm256_setzero_si256();
-        s->u.prev = b;
+        if (unlikely(s->dirty)) {
+            s->dirty = 0;
+            s->u.err = _mm256_or_si256(s->u.err, s->u.inc);
+            s->u.inc = _mm256_setzero_si256();
+            s->u.prev = _mm256_setzero_si256();
+        }
     } else {
+        s->dirty = 1;
         s1_utf8_step(&s->u, a);
         s1_utf8_step(&s->u, b);
     }
@@ -6877,6 +6889,7 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     s.next_esc = s.prev_in = s.prev_scalar = 0;
     s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
     s.nna = 0;
+    s.dirty = 0;
     for (; pos < full; pos += 64, blk++) {
         st = s1_block(buf + pos, dst != buf ? dst + pos : NULL, &s, spc + blk);
         /* bit_indexer: write previous block while this one is in flight */
