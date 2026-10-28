@@ -35,8 +35,13 @@
  *    terminated). Escaped strings are decoded into the parser's scratch
  *    buffer. Both stay valid until the next yyjson_od_parse() or rewind.
  *  - Object keys are reported and compared raw (escaped form), as in
- *    simdjson. Keys passed by yyjson_od_obj_find() are not validated; keys
- *    returned by yyjson_od_obj_next() are (escapes must be well formed).
+ *    simdjson: yyjson_od_obj_next() yields a yyjson_od_key that points into
+ *    the input and is neither measured nor validated; yyjson_od_key_eq()
+ *    compares it raw, yyjson_od_key_get() decodes and validates it. A key
+ *    only compared raw (key_eq, obj_find, find_unordered) or not looked at
+ *    is never validated, so a document with a bad escape in such a key is
+ *    accepted (simdjson semantics); its UTF-8 and the structure are still
+ *    checked. Values are always validated when read.
  *  - Numbers are parsed exactly like the yyjson DOM reader with default
  *    flags: integers become UINT/SINT, integers that do not fit 64 bits and
  *    all numbers with a fraction or exponent become REAL (correctly rounded).
@@ -125,6 +130,16 @@ typedef struct yyjson_od_str {
     const char *ptr;
     size_t len;
 } yyjson_od_str;
+
+/** Raw object key from yyjson_od_obj_next(): `ptr` points at the first
+    byte after the opening quote, in the input (escaped form). The key is
+    not measured or validated; it ends at the first unescaped '"', which
+    lies within the first `lim` bytes. Fields are internal except `ptr`. */
+typedef struct yyjson_od_key {
+    const char *ptr;
+    uint32_t lim;               /* bytes up to the ':' after the key */
+    uint32_t tok;               /* token of the key */
+} yyjson_od_key;
 
 /*------------------------------------------------------------------------------
  * Parser and document
@@ -500,14 +515,16 @@ yyjson_api_inline bool yyjson_od_get_arr(yyjson_od_val *v, yyjson_od_iter *it) {
     return yyjson_od__begin(v, it, '[', ']');
 }
 
-/** Next object member: its raw key (escaped form, not NUL-terminated) and
-    value handle. Unread parts of the previous member are skipped.
+/** Next object member: its raw key and value handle. The key is not
+    measured, unescaped or validated here (like simdjson's field_key());
+    use yyjson_od_key_eq() to compare it, or yyjson_od_key_get() to decode
+    and validate it. Unread parts of the previous member are skipped.
     @return false at the end of the object or on error. */
 yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
-                                          yyjson_od_str *key,
+                                          yyjson_od_key *key,
                                           yyjson_od_val *val) {
     yyjson_od_doc *d = it->doc;
-    uint32_t ip, s, e, bs;
+    uint32_t ip, s;
     if (!yyjson_od__sep(it, '}')) return false;
     ip = d->ip;
     if (yyjson_od_unlikely(ip + 2 >= d->ntok ||
@@ -518,25 +535,56 @@ yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
         return yyjson_od__fail(d, YYJSON_OD_TAPE);
     }
     s = d->idx[ip] + 1;
-    e = yyjson_od__str_scan(d, ip, s, &bs);
-    if (yyjson_od_unlikely(!e)) {
-        e = yyjson_od__str_end(d, ip);
-        if (!e) {
-            it->state = 2;
-            return yyjson_od__fail(d, YYJSON_OD_TAPE);
-        }
-        if (!yyjson_od__key_check(d, s, bs, e)) {
-            it->state = 2;
-            return false;
-        }
-    }
     key->ptr = (const char *)d->buf + s;
-    key->len = (size_t)(e - s);
+    key->lim = d->idx[ip + 1] - s; /* the closing quote lies before ':' */
+    key->tok = ip;
     ip += 2;
     d->ip = ip;
     val->doc = d;
     val->tok = ip;
     return true;
+}
+
+/** Compare a raw key with `str` (raw, escaped form; like simdjson's
+    raw_key comparison): true if the key is exactly those bytes. `str` must
+    not contain '"' or '\\' unless written in the document's escaped form.
+    The key is not validated. */
+yyjson_api_inline bool yyjson_od_key_eq(const yyjson_od_key *key,
+                                        const char *str, size_t len) {
+    return len < key->lim && key->ptr[len] == '"' &&
+           memcmp(key->ptr, str, len) == 0;
+}
+
+/** Length of a raw key in bytes (escaped form, without quotes); 0 for an
+    empty key or on error (TAPE). Not validated. */
+yyjson_api_inline size_t yyjson_od_key_len(yyjson_od_doc *d,
+                                           const yyjson_od_key *key) {
+    uint32_t e = yyjson_od__str_end(d, key->tok);
+    if (yyjson_od_unlikely(!e)) {
+        yyjson_od__fail(d, YYJSON_OD_TAPE);
+        return 0;
+    }
+    return (size_t)(e - (d->idx[key->tok] + 1));
+}
+
+/** Decode a raw key: unescaped and validated (STRING error on a bad
+    escape), as a view into the input when it has no escape, else in the
+    scratch buffer (valid like strings from yyjson_od_get_str()). Does not
+    move any cursor. @return false on error. */
+yyjson_api_inline bool yyjson_od_key_get(yyjson_od_doc *d,
+                                         const yyjson_od_key *key,
+                                         yyjson_od_str *out) {
+    uint32_t s = d->idx[key->tok] + 1, e, bs;
+    if (yyjson_od_unlikely(d->err)) return false;
+    e = yyjson_od__str_scan(d, key->tok, s, &bs);
+    if (yyjson_od_likely(e)) {
+        out->ptr = (const char *)d->buf + s;
+        out->len = (size_t)(e - s);
+        return true;
+    }
+    e = yyjson_od__str_end(d, key->tok);
+    if (yyjson_od_unlikely(!e)) return yyjson_od__fail(d, YYJSON_OD_TAPE);
+    return yyjson_od__str_slow(d, s, bs, e, out);
 }
 
 /** Find the next member whose raw key equals `key` (ordered lookup: the

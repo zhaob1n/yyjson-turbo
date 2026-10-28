@@ -203,8 +203,8 @@ struct Citm {
   typedef CitmR R;
   static void od(Ctx &c, R &r) {
     yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
-    yyjson_od_iter an = odo(odf(root, "areaNames")); yyjson_od_str k; yyjson_od_val v, pv, x, y;
-    while (yyjson_od_obj_next(&an, &k, &v)) r.names.push_back({sv(k.ptr, k.len), ods(v)});
+    yyjson_od_iter an = odo(odf(root, "areaNames")); yyjson_od_key k; yyjson_od_val v, pv, x, y;
+    while (yyjson_od_obj_next(&an, &k, &v)) { yyjson_od_str ks; CHECK(yyjson_od_key_get(d, &k, &ks)); r.names.push_back({sv(ks.ptr, ks.len), ods(v)}); }
     yyjson_od_iter ps = oda(odf(root, "performances"));
     while (yyjson_od_arr_next(&ps, &pv)) {
       yyjson_od_iter p = odo(pv);
@@ -307,7 +307,7 @@ struct GsR { sv a, b, c; bool operator==(const GsR &o) const { return a == o.a &
 struct Gsoc {
   typedef std::vector<GsR> R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d)); yyjson_od_str k; yyjson_od_val v;
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d)); yyjson_od_key k; yyjson_od_val v;
     while (yyjson_od_obj_next(&root, &k, &v)) {
       yyjson_od_iter p = odo(v); GsR g; g.a = ods(odf(p, "name"));
       { yyjson_od_iter s = odo(odf(p, "sponsor")); g.b = ods(odf(s, "name")); }
@@ -353,7 +353,7 @@ struct Update {
   typedef std::vector<UcR> R;
   static void od(Ctx &c, R &r) {
     yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
-    yyjson_od_iter pl = odo(odf(root, "plugins")); yyjson_od_str k; yyjson_od_val v, x;
+    yyjson_od_iter pl = odo(odf(root, "plugins")); yyjson_od_key k; yyjson_od_val v, x;
     while (yyjson_od_obj_next(&pl, &k, &v)) {
       yyjson_od_iter p = odo(v); UcR u; u.ndep = 0;
       yyjson_od_iter dp = oda(odf(p, "dependencies")); while (yyjson_od_arr_next(&dp, &x)) u.ndep++;
@@ -384,7 +384,7 @@ struct Update {
 struct WalkR { u64 obj = 0, arr = 0, str = 0, sbytes = 0, num = 0, t = 0, f = 0, nul = 0, keys = 0; double sum = 0;
   bool operator==(const WalkR &o) const { return obj == o.obj && arr == o.arr && str == o.str && sbytes == o.sbytes && num == o.num && t == o.t && f == o.f && nul == o.nul && keys == o.keys && memcmp(&sum, &o.sum, 8) == 0; } };
 static void odwalk(yyjson_od_val v, WalkR &r) {
-  yyjson_od_iter it; yyjson_od_val c; yyjson_od_str k; bool b;
+  yyjson_od_iter it; yyjson_od_val c; yyjson_od_key k; bool b;
   switch (yyjson_od_get_type(&v)) {
     case YYJSON_OD_TYPE_OBJ: r.obj++; CHECK(yyjson_od_get_obj(&v, &it)); while (yyjson_od_obj_next(&it, &k, &c)) { r.keys++; odwalk(c, r); } break;
     case YYJSON_OD_TYPE_ARR: r.arr++; CHECK(yyjson_od_get_arr(&v, &it)); while (yyjson_od_arr_next(&it, &c)) odwalk(c, r); break;

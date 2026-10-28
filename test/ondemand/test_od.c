@@ -64,20 +64,19 @@ static void dom_dump(sbuf *b, yyjson_val *v) {
 static int od_dump(sbuf *b, yyjson_od_val *v, int depth) {
     yyjson_od_iter it;
     yyjson_od_val x;
-    yyjson_od_str s, k;
+    yyjson_od_str s, ks;
+    yyjson_od_key k;
     yyjson_val nv;
     bool bv = false;
-    k.ptr = NULL;
-    k.len = 0;
+    memset(&k, 0, sizeof(k));
     if (depth > 900) return 0;
     switch (yyjson_od_get_type(v)) {
     case YYJSON_OD_TYPE_OBJ:
         if (!yyjson_od_get_obj(v, &it)) return 0;
         sb_put(b, "{", 1);
         while (yyjson_od_obj_next(&it, &k, &x)) {
-            /* keys are raw: unescape through a string re-read is not
-               available, so compare via DOM only when escape-free */
-            sb_str(b, k.ptr, k.len);
+            if (!yyjson_od_key_get(v->doc, &k, &ks)) return 0;
+            sb_str(b, ks.ptr, ks.len);
             if (!od_dump(b, &x, depth + 1)) return 0;
         }
         if (yyjson_od_doc_err(v->doc)) return 0;
@@ -172,7 +171,6 @@ static int diff(const char *src, size_t len, int verbose) {
     if (dd) dom_dump(&b, yyjson_doc_get_root(dd));
     if (!oka && !okb) r = -1;
     else if (oka && okb && a.n == b.n && !memcmp(a.p, b.p, a.n)) r = 0;
-    else if (oka && okb && memchr(src, '\\', len)) r = 0; /* raw keys differ */
     else r = 1;
     if (r == 1 && verbose) {
         fprintf(stderr, "MISMATCH od=%d dom=%d input(%u): %.*s\n", oka, okb,
@@ -221,6 +219,35 @@ static void unit(void) {
         if (diff(good[i], strlen(good[i]), 1) != 0) { fprintf(stderr, "good[%u]\n", (unsigned)i); g_fail++; }
     for (i = 0; i < sizeof(bad) / sizeof(*bad); i++)
         if (diff(bad[i], strlen(bad[i]), 1) != -1) { fprintf(stderr, "bad[%u]\n", (unsigned)i); g_fail++; }
+
+    /* raw keys: compare, length, decode on demand */
+    d = P_parse("{\"ab\":1, \"a\\u0062\" :2,\"\":3,\"x\\q\":4}", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_obj(&r, &it));
+    {
+        yyjson_od_key k;
+        CHECK(yyjson_od_obj_next(&it, &k, &v));
+        CHECK(yyjson_od_key_eq(&k, "ab", 2) && !yyjson_od_key_eq(&k, "a", 1));
+        CHECK(!yyjson_od_key_eq(&k, "abc", 3) && yyjson_od_key_len(d, &k) == 2);
+        CHECK(yyjson_od_key_get(d, &k, &s) && s.len == 2 && !memcmp(s.ptr, "ab", 2));
+        CHECK(yyjson_od_obj_next(&it, &k, &v));
+        CHECK(!yyjson_od_key_eq(&k, "ab", 2) && yyjson_od_key_eq(&k, "a\\u0062", 7));
+        CHECK(yyjson_od_key_len(d, &k) == 7);
+        CHECK(yyjson_od_key_get(d, &k, &s) && s.len == 2 && !memcmp(s.ptr, "ab", 2));
+        CHECK(yyjson_od_get_uint(&v, &u64) && u64 == 2);
+        CHECK(yyjson_od_obj_next(&it, &k, &v));
+        CHECK(yyjson_od_key_eq(&k, "", 0) && yyjson_od_key_len(d, &k) == 0);
+        CHECK(yyjson_od_key_get(d, &k, &s) && s.len == 0);
+        CHECK(yyjson_od_obj_next(&it, &k, &v));
+        /* a bad escape is only seen when the key is decoded */
+        CHECK(yyjson_od_key_eq(&k, "x\\q", 3) && yyjson_od_doc_err(d) == 0);
+        CHECK(!yyjson_od_key_get(d, &k, &s));
+        CHECK(yyjson_od_doc_err(d) == YYJSON_OD_STRING);
+    }
+    d = P_parse("{\"x\\q\":4}", buf); /* raw-compared only: accepted */
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_obj(&r, &it) && yyjson_od_obj_find(&it, "y", 1, &v) == false);
+    CHECK(yyjson_od_doc_finish(d));
 
     /* find_field in order + skipping */
     d = P_parse("{\"x\":[1,[2,{\"q\":3}]],\"id\":-42,\"u\":7,\"name\":\"n\\tm\",\"f\":2.5,\"z\":{}}", buf);
