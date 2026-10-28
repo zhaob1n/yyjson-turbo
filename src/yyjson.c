@@ -8084,6 +8084,78 @@ yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign) {
 }
 #endif /* YYJSON_DISABLE_STAGE1 */
 
+/* internal: fallback reads must not be re-routed by YYJSON_STAGE1_FORCE */
+#define S1_NO_FORCE ((yyjson_read_flag)1 << 30)
+#if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
+#   define S1_NO_FORCE_BIT S1_NO_FORCE
+#else
+#   define S1_NO_FORCE_BIT 0
+#endif
+
+/* Entry for YYJSON_READ_STAGE1 / YYJSON_READ_NO_NUL_TERM. Kept out of line
+   so that yyjson_read_opts() (the default path) compiles like upstream.
+   Falls back to the regular reader with both flags cleared. */
+static_noinline yyjson_doc *s1_read_opts(char *dat, usize len,
+                                         yyjson_read_flag flg,
+                                         const yyjson_alc *alc_ptr,
+                                         yyjson_read_err *err) {
+#ifndef YYJSON_DISABLE_STAGE1
+    yyjson_read_err tmp_err;
+    yyjson_alc alc = alc_ptr ? *alc_ptr : YYJSON_DEFAULT_ALC;
+    yyjson_doc *doc = NULL;
+    u8 *hdr, *eof;
+    int s1r;
+    if (!err) err = &tmp_err;
+    if ((flg & YYJSON_READ_STAGE1) && char_is_ctn(*(const u8 *)dat) &&
+        len < (usize)0xFFFFFF00u) {
+        if (flg & YYJSON_READ_NO_NUL_TERM) {
+            /* zero-copy: build directly on the const input (never written) */
+            if (!(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM))) {
+                s1r = s1_read((u8 *)dat, (u8 *)dat + len, alc, flg, &doc,
+                              (const u8 *)dat);
+                if (s1r == 0) goto done;
+                if (s1r == 3) goto fail_alloc;
+            }
+        } else if (!(flg & ~YYJSON_READ_STAGE1)) {
+            /* stage1 fuses the input copy into its indexing pass */
+            hdr = (u8 *)alc.malloc(alc.ctx, len + YYJSON_PADDING_SIZE);
+            if (unlikely(!hdr)) goto fail_alloc;
+            eof = hdr + len;
+            memset(eof, 0, YYJSON_PADDING_SIZE);
+            s1r = s1_read(hdr, eof, alc, flg, &doc, (const u8 *)dat);
+            if (s1r == 0) goto done;
+            alc.free(alc.ctx, hdr);
+            if (s1r == 3) goto fail_alloc;
+        } else if (!(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_INSITU))) {
+            hdr = (u8 *)dat;
+            eof = hdr + len;
+            memset(eof, 0, YYJSON_PADDING_SIZE);
+            s1r = s1_read(hdr, eof, alc, flg, &doc, hdr);
+            if (s1r == 0) goto done;
+            if (s1r == 3) goto fail_alloc;
+            if (s1r == 2) { /* buffer already modified */
+                err->pos = 0;
+                err->msg = "invalid JSON (stage1 reader, insitu)";
+                err->code = YYJSON_READ_ERROR_UNEXPECTED_CHARACTER;
+                return NULL;
+            }
+        }
+    }
+    goto fallback;
+done:
+    memset(err, 0, sizeof(yyjson_read_err));
+    return doc;
+fail_alloc:
+    err->pos = 0;
+    err->msg = MSG_MALLOC;
+    err->code = YYJSON_READ_ERROR_MEMORY_ALLOCATION;
+    return NULL;
+fallback:
+#endif
+    flg &= ~(YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM);
+    return yyjson_read_opts(dat, len, flg | S1_NO_FORCE_BIT, alc_ptr, err);
+}
+
 yyjson_doc *yyjson_read_opts(char *dat, usize len,
                              yyjson_read_flag flg,
                              const yyjson_alc *alc_ptr,
@@ -8106,28 +8178,15 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     if (unlikely(!dat)) return_err(0, INVALID_PARAMETER, "input data is NULL");
     if (unlikely(!len)) return_err(0, INVALID_PARAMETER, "input length is 0");
 
+    /* optional readers live out of line so this function compiles as
+       upstream's; one test of two flag bits on the default path */
 #if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
-    /* testing: route eligible reads to stage1 */
     if (!(flg & ~(YYJSON_READ_INSITU | YYJSON_READ_NO_NUL_TERM)))
-        flg |= YYJSON_READ_STAGE1;
+        flg |= YYJSON_READ_STAGE1; /* testing: route eligible reads */
+    flg &= ~S1_NO_FORCE;
 #endif
-    if (flg & YYJSON_READ_NO_NUL_TERM) {
-#ifndef YYJSON_DISABLE_STAGE1
-        /* zero-copy: build directly on the const input (never written) */
-        if ((flg & YYJSON_READ_STAGE1) &&
-            !(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM)) &&
-            char_is_ctn(*(const u8 *)dat) && len < (usize)0xFFFFFF00u) {
-            int s1r = s1_read((u8 *)dat, (u8 *)dat + len, alc, flg, &doc,
-                              (const u8 *)dat);
-            if (s1r == 0) {
-                memset(err, 0, sizeof(yyjson_read_err));
-                return doc;
-            }
-            if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
-            flg &= ~YYJSON_READ_STAGE1; /* fall back to the regular reader */
-        }
-#endif
-        flg &= ~YYJSON_READ_NO_NUL_TERM;
+    if (unlikely(flg & (YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM))) {
+        return s1_read_opts(dat, len, flg, alc_ptr, err);
     }
     /* add 4-byte zero padding for input data if necessary */
     if (has_flg(INSITU)) {
@@ -8144,22 +8203,6 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         }
         eof = hdr + len;
         cur = hdr;
-#ifndef YYJSON_DISABLE_STAGE1
-        /* stage1 fuses the input copy into its indexing pass */
-        if ((flg & YYJSON_READ_STAGE1) &&
-            !(flg & ~YYJSON_READ_STAGE1) &&
-            char_is_ctn(*(const u8 *)dat) && len < (usize)0xFFFFFF00u) {
-            int s1r;
-            memset(eof, 0, YYJSON_PADDING_SIZE);
-            s1r = s1_read(hdr, eof, alc, flg, &doc, (const u8 *)dat);
-            if (s1r == 0) {
-                memset(err, 0, sizeof(yyjson_read_err));
-                return doc;
-            }
-            if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
-            flg &= ~YYJSON_READ_STAGE1; /* fall back to the regular reader */
-        }
-#endif
         memcpy(hdr, dat, len);
     }
     memset(eof, 0, YYJSON_PADDING_SIZE);
@@ -8183,27 +8226,6 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         }
     }
 
-#ifndef YYJSON_DISABLE_STAGE1
-    if ((flg & YYJSON_READ_STAGE1) &&
-        !(flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_INSITU)) &&
-        char_is_ctn(*cur) && len < (usize)0xFFFFFF00u) {
-        int s1r = s1_read(hdr, eof, alc, flg, &doc, hdr);
-        if (s1r == 0) {
-            memset(err, 0, sizeof(yyjson_read_err));
-            return doc;
-        }
-        if (s1r == 3) return_err(0, MEMORY_ALLOCATION, MSG_MALLOC);
-        if (s1r == 2) {
-            if (has_flg(INSITU)) {
-                /* buffer already modified; report a generic error */
-                return_err(0, UNEXPECTED_CHARACTER,
-                           "invalid JSON (stage1 reader, insitu)");
-            }
-            memcpy(hdr, dat, len);
-            memset(eof, 0, YYJSON_PADDING_SIZE);
-        }
-    }
-#endif
     /* read json document */
     if (likely(char_is_ctn(*cur))) {
         if (char_is_space(cur[1]) && char_is_space(cur[2])) {
