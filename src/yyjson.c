@@ -4826,12 +4826,27 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #undef return_err
 }
 
+/* Code placement of the optional readers, chosen per compiler by dynamic
+   instruction counts: clang allocates registers better for the default
+   reader when the new code is out of line, gcc when it is inlined. */
+#ifndef YYJSON_READ_OUTLINE
+#  if defined(__clang__)
+#    define YYJSON_READ_OUTLINE 1
+#  else
+#    define YYJSON_READ_OUTLINE 0
+#  endif
+#endif
+#if YYJSON_READ_OUTLINE
+#  define skip_ascii_simd_attr static_noinline
+#else
+#  define skip_ascii_simd_attr static_inline
+#endif
 #if YYJSON_STR_SIMD_AVX512 || YYJSON_STR_SIMD_AVX2
 /** Long-string scan kept out of line so it does not change the register
     allocation of the (inlined) string and number readers. Returns the first
     byte that is '"', '\\' or < 0x20, or the position where fewer than one
     vector of input remains; the scalar loop continues from there. */
-static_noinline u8 *skip_ascii_simd(u8 *src, u8 *eof) {
+skip_ascii_simd_attr u8 *skip_ascii_simd(u8 *src, u8 *eof) {
 #if YYJSON_STR_SIMD_AVX512
     while (eof - src >= 64) {
         __m512i v = _mm512_loadu_si512((const void *)src);
@@ -8169,7 +8184,11 @@ fallback:
     return yyjson_read_opts(dat, len, flg | S1_NO_FORCE_BIT, alc_ptr, err);
 }
 
+#if YYJSON_READ_OUTLINE
 static_noinline yyjson_doc *read_opts_def(char *dat, usize len,
+#else
+yyjson_doc *yyjson_read_opts(char *dat, usize len,
+#endif
                              yyjson_read_flag flg,
                              const yyjson_alc *alc_ptr,
                              yyjson_read_err *err) {
@@ -8191,6 +8210,16 @@ static_noinline yyjson_doc *read_opts_def(char *dat, usize len,
     if (unlikely(!dat)) return_err(0, INVALID_PARAMETER, "input data is NULL");
     if (unlikely(!len)) return_err(0, INVALID_PARAMETER, "input length is 0");
 
+#if !YYJSON_READ_OUTLINE
+#if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
+    if (!(flg & ~(YYJSON_READ_INSITU | YYJSON_READ_NO_NUL_TERM)))
+        flg |= YYJSON_READ_STAGE1; /* testing: route eligible reads */
+    flg &= ~S1_NO_FORCE;
+#endif
+    if (unlikely(flg & (YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM))) {
+        return s1_read_opts(dat, len, flg, alc_ptr, err);
+    }
+#endif
     /* add 4-byte zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         hdr = (u8 *)dat;
@@ -8257,6 +8286,7 @@ static_noinline yyjson_doc *read_opts_def(char *dat, usize len,
 #undef return_err
 }
 
+#if YYJSON_READ_OUTLINE
 yyjson_doc *yyjson_read_opts(char *dat, usize len,
                              yyjson_read_flag flg,
                              const yyjson_alc *alc_ptr,
@@ -8277,6 +8307,7 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         return s1_read_opts(dat, len, flg, alc_ptr, err);
     }
 }
+#endif
 
 #if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
 
