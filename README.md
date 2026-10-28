@@ -1,3 +1,9 @@
+# yyjson-turbo
+
+> **Unofficial fork** of [ibireme/yyjson](https://github.com/ibireme/yyjson), MIT licensed like the original.
+> It adds SIMD string reading/writing, an optional two-stage SIMD reader (`YYJSON_READ_STAGE1`),
+> and an experimental forward-only On Demand API (`src/yyjson_ondemand.h`). Not affiliated with or endorsed by the yyjson author.
+
 
 # Introduction
 
