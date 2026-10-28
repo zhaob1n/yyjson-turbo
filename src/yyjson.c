@@ -8073,9 +8073,14 @@ yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
    header can declare it `const` and the caller's cursor stays in
    registers across the call. */
 yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign) {
+#if !YYJSON_DISABLE_FAST_FP_CONV
     yyjson_val v;
     if (!s1_f64_conv(sig, exp, sign != 0, &v)) return ~(u64)0;
     return v.uni.u64;
+#else
+    (void)sig; (void)exp; (void)sign;
+    return ~(u64)0; /* no fast conversion: always use the generic reader */
+#endif
 }
 #endif /* YYJSON_DISABLE_STAGE1 */
 
