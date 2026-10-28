@@ -137,21 +137,6 @@ static bool od_reserve(yyjson_od_parser *p, size_t len) {
     return true;
 }
 
-/* zero-padded private copy of the input in p->tmp */
-static bool od_tmp(yyjson_od_parser *p, const char *buf, size_t len) {
-    if (p->tmp_cap < len + YYJSON_OD_PADDING) {
-        if (p->tmp) p->alc.free(p->alc.ctx, p->tmp);
-        p->tmp_cap = 0;
-        p->tmp = (unsigned char *)p->alc.malloc(p->alc.ctx,
-                                                len + YYJSON_OD_PADDING);
-        if (!p->tmp) return false;
-        p->tmp_cap = len + YYJSON_OD_PADDING;
-    }
-    memcpy(p->tmp, buf, len);
-    memset(p->tmp + len, 0, YYJSON_OD_PADDING);
-    return true;
-}
-
 #define OD_RET(c) do { if (code) *code = (c); return NULL; } while (0)
 
 yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p, const char *buf,
@@ -177,37 +162,28 @@ yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p, const char *buf,
     d->scr_end = p->scr + p->cap + 64;
     d->len = len;
     d->ntok = (uint32_t)ntok;
-    yyjson_od_doc_rewind(d);
+    d->ip = 0;
+    d->depth = 0;
+    d->err = 0;
+    d->err_tok = 0;
     c0 = d->buf[p->idx[0]];
     if (c0 == '{' || c0 == '[') {
         /* every scalar is then followed by a structural byte inside the
            input, which keeps number parsing in bounds */
         cl = d->buf[p->idx[ntok - 1]];
         if (cl != '}' && cl != ']') OD_RET(YYJSON_OD_TAPE);
-        /* point the sentinels at a byte that no iterator step accepts (not
-           a value start, separator or closing bracket), so steps need no
-           bounds check: found within the first bytes of nearly any input
-           (whitespace, a letter of a key, a '.'); otherwise use a copy
-           with one space appended */
-        {
-            size_t i;
-            for (i = 0; i < len; i++) {
-                unsigned char c = d->buf[i];
-                if (!yyjson_od__vtab[c] && c != ',' && c != ':' && c != '}' &&
-                    c != ']')
-                    break;
-            }
-            if (i == len) {
-                if (!od_tmp(p, buf, len)) OD_RET(YYJSON_OD_MEMORY);
-                p->tmp[len] = ' ';
-                d->buf = p->tmp;
-            }
-            p->idx[ntok] = p->idx[ntok + 1] = p->idx[ntok + 2] =
-                p->idx[ntok + 3] = (uint32_t)i;
-        }
     } else {
         /* scalar root: parse a zero-padded private copy */
-        if (!od_tmp(p, buf, len)) OD_RET(YYJSON_OD_MEMORY);
+        if (p->tmp_cap < len + YYJSON_OD_PADDING) {
+            if (p->tmp) p->alc.free(p->alc.ctx, p->tmp);
+            p->tmp_cap = 0;
+            p->tmp = (unsigned char *)p->alc.malloc(p->alc.ctx,
+                                                    len + YYJSON_OD_PADDING);
+            if (!p->tmp) OD_RET(YYJSON_OD_MEMORY);
+            p->tmp_cap = len + YYJSON_OD_PADDING;
+        }
+        memcpy(p->tmp, buf, len);
+        memset(p->tmp + len, 0, YYJSON_OD_PADDING);
         d->buf = p->tmp;
     }
     return d;
@@ -218,13 +194,7 @@ int yyjson_od_iterate(yyjson_od_parser *p, const char *buf, size_t len,
     int code;
     yyjson_od_doc *d = yyjson_od_parse(p, buf, len, &code);
     if (!d) {
-        /* a document whose root is no value: every call fails */
-        static const uint32_t zidx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        static const unsigned char junk[YYJSON_OD_PADDING] = {' '};
         memset(doc, 0, sizeof(*doc));
-        doc->buf = junk;
-        doc->idx = zidx;
-        yyjson_od_doc_rewind(doc);
         doc->err = code;
         return code;
     }
@@ -266,25 +236,14 @@ bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t bs,
     return true;
 }
 
-/* token containing byte offset `off` (for error positions) */
-static uint32_t od_tok_at(const yyjson_od_doc *d, uint32_t off) {
-    uint32_t lo = 0, hi = d->ntok;
-    while (hi - lo > 1) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (d->idx[mid] <= off) lo = mid;
-        else hi = mid;
-    }
-    return lo;
-}
-
 bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t bs,
                          uint32_t e, yyjson_od_str *out) {
     unsigned char *dst = d->scr, *end;
     if ((size_t)(d->scr_end - dst) < (size_t)(e - s) + 40)
-        return yyjson_od__fail(d, YYJSON_OD_MEMORY, od_tok_at(d, s));
+        return yyjson_od__fail(d, YYJSON_OD_MEMORY); /* only on re-reads */
     end = yyjson_od__str_esc2(d->buf + s, d->buf + (bs < e ? bs : e),
                               d->buf + e, dst);
-    if (!end) return yyjson_od__fail(d, YYJSON_OD_STRING, od_tok_at(d, s));
+    if (!end) return yyjson_od__fail(d, YYJSON_OD_STRING);
     out->ptr = (const char *)dst;
     out->len = (size_t)(end - dst);
     d->scr = end + 1;
@@ -321,13 +280,19 @@ size_t yyjson_od_count(yyjson_od_val *v) {
     int32_t depth = 1;
     size_t cnt = 1;
     unsigned char c, close;
+    if (d->err) return 0;
+    if (ip != d->ip) {
+        yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+        return 0;
+    }
     c = YYJSON_OD_CH(d, ip);
     if (c != '{' && c != '[') {
-        yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE, ip);
+        yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE);
         return 0;
     }
     close = (unsigned char)(c + 2);
     ip++;
+    if (ip >= n) { yyjson_od__fail(d, YYJSON_OD_TAPE); return 0; }
     if (YYJSON_OD_CH(d, ip) == close) return 0;
     for (; ip < n; ip++) {
         c = YYJSON_OD_CH(d, ip);
@@ -335,29 +300,31 @@ size_t yyjson_od_count(yyjson_od_val *v) {
         if (depth == 1 && c == ',') cnt++;
         else if (depth == 0) return cnt;
     }
-    yyjson_od__fail(d, YYJSON_OD_TAPE, v->tok);
+    yyjson_od__fail(d, YYJSON_OD_TAPE);
     return 0;
 }
 
 bool yyjson_od_raw_json(yyjson_od_val *v, yyjson_od_str *out) {
     yyjson_od_doc *d = v->doc;
-    uint32_t s, e, t;
+    int pos = yyjson_od__pos(v);
+    uint32_t s, e;
     unsigned char c;
+    if (!pos) return false;
     s = d->idx[v->tok];
     c = d->buf[s];
     if (c == '{' || c == '[') {
-        t = yyjson_od__after(d, v->tok);
-        if (!t) return false;
-        d->end_of = v->tok; /* the parent steps over it without a skip */
-        d->end_ip = t;
-        e = d->idx[t - 1] + 1;
+        if (pos != 1) return yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+        if (!yyjson_od__skip_val(d, d->depth)) return false;
+        e = d->idx[d->ip - 1] + 1;
     } else if (c == '"') {
         e = yyjson_od__str_end(d, v->tok);
-        if (!e) return yyjson_od__fail(d, YYJSON_OD_TAPE, v->tok);
+        if (!e) return yyjson_od__fail(d, YYJSON_OD_TAPE);
         e++;
+        if (pos == 1) d->ip++;
     } else {
         e = d->idx[v->tok + 1];
         while (e > s && YYJSON_OD_WS(d->buf[e - 1])) e--;
+        if (pos == 1) d->ip++;
     }
     out->ptr = (const char *)d->buf + s;
     out->len = (size_t)(e - s);
@@ -383,14 +350,13 @@ const char *yyjson_od_err_msg(int code) {
 }
 
 bool yyjson_od_doc_finish(yyjson_od_doc *d) {
-    uint32_t e = 1;
-    unsigned char c;
     if (d->err) return false;
-    c = YYJSON_OD_CH(d, 0);
-    if (c == '{' || c == '[') {
-        e = yyjson_od__after(d, 0);
-        if (!e) return false;
+    if (d->depth > 0) {
+        if (!yyjson_od__skip_to(d, 0)) return false;
+    } else if (d->ip == 0 && d->ntok > 0) {
+        if (!yyjson_od__skip_val(d, 0)) return false;
     }
-    if (e != d->ntok) return yyjson_od__fail(d, YYJSON_OD_TAPE, e);
+    if (d->depth != 0 || d->ip != d->ntok)
+        return yyjson_od__fail(d, YYJSON_OD_TAPE);
     return true;
 }

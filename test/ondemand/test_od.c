@@ -211,14 +211,12 @@ static void unit(void) {
     char buf[512];
     size_t i;
     yyjson_od_doc *d;
-    yyjson_od_val r, v, x;
-    yyjson_od_iter it, it2, it3;
+    yyjson_od_val r, v;
+    yyjson_od_iter it, it2;
     yyjson_od_str s;
     int64_t i64 = 0;
     uint64_t u64 = 0;
     double f;
-    memset(&it2, 0, sizeof(it2));
-    memset(&it3, 0, sizeof(it3));
     for (i = 0; i < sizeof(good) / sizeof(*good); i++)
         if (diff(good[i], strlen(good[i]), 1) != 0) { fprintf(stderr, "good[%u]\n", (unsigned)i); g_fail++; }
     for (i = 0; i < sizeof(bad) / sizeof(*bad); i++)
@@ -244,8 +242,7 @@ static void unit(void) {
     CHECK(yyjson_od_doc_err(d) == 0);
     CHECK(yyjson_od_doc_finish(d));
 
-#if YYJSON_OD_CHECKS
-    /* development checks: a container handle used after its parent moved on */
+    /* out-of-order container use */
     d = P_parse("[[1,2],[3]]", buf);
     r = yyjson_od_doc_root(d);
     CHECK(yyjson_od_get_arr(&r, &it));
@@ -256,22 +253,19 @@ static void unit(void) {
         CHECK(!yyjson_od_get_arr(&v1, &it2));
         CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
     }
-    /* development checks: a container iterated twice */
-    d = P_parse("[[1,2],[3]]", buf);
+
+#if YYJSON_OD_CHECKS
+    /* development checks: reading ahead of the cursor */
+    d = P_parse("[[1,2],3]", buf);
     r = yyjson_od_doc_root(d);
     CHECK(yyjson_od_get_arr(&r, &it));
     CHECK(yyjson_od_arr_next(&it, &v));
-    CHECK(yyjson_od_get_arr(&v, &it2));
-    while (yyjson_od_arr_next(&it2, &x)) {}
-    CHECK(yyjson_od_doc_err(d) == 0);
-    CHECK(!yyjson_od_get_arr(&v, &it2));
-    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
-    /* development checks: root iterated twice */
-    d = P_parse("[1]", buf);
-    r = yyjson_od_doc_root(d);
-    CHECK(yyjson_od_get_arr(&r, &it));
-    CHECK(!yyjson_od_get_arr(&r, &it2));
-    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
+    {
+        yyjson_od_val ahead = v;
+        ahead.tok += 4; /* the element 3 */
+        CHECK(!yyjson_od_get_sint(&ahead, &i64));
+        CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
+    }
     /* development checks: child iterator used after its parent moved on */
     d = P_parse("[[1,2],[3]]", buf);
     r = yyjson_od_doc_root(d);
@@ -281,31 +275,7 @@ static void unit(void) {
     CHECK(yyjson_od_arr_next(&it, &v)); /* skips the rest of [1,2] */
     CHECK(!yyjson_od_arr_next(&it2, &v));
     CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
-    /* development checks: parent used while a child is live, then child */
-    d = P_parse("{\"a\":{\"b\":1,\"c\":2},\"d\":3}", buf);
-    r = yyjson_od_doc_root(d);
-    CHECK(yyjson_od_get_obj(&r, &it));
-    CHECK(yyjson_od_obj_find(&it, "a", 1, &v) && yyjson_od_get_obj(&v, &it2));
-    CHECK(yyjson_od_obj_find(&it2, "b", 1, &x));
-    CHECK(yyjson_od_obj_find(&it, "d", 1, &v) && yyjson_od_get_uint(&v, &u64) && u64 == 3);
-    CHECK(!yyjson_od_obj_find(&it2, "c", 1, &x));
-    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
 #endif
-    /* partly read and abandoned children are skipped by the parent */
-    d = P_parse("[[1,[2,3],4],{\"a\":[5],\"b\":6},[7],8]", buf);
-    r = yyjson_od_doc_root(d);
-    CHECK(yyjson_od_get_arr(&r, &it));
-    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_arr(&v, &it2));
-    CHECK(yyjson_od_arr_next(&it2, &x) && yyjson_od_get_uint(&x, &u64) && u64 == 1);
-    CHECK(yyjson_od_arr_next(&it2, &x) && yyjson_od_get_arr(&x, &it3));
-    CHECK(yyjson_od_arr_next(&it3, &x)); /* [2,3] abandoned inside */
-    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_obj(&v, &it2));
-    CHECK(yyjson_od_obj_find(&it2, "a", 1, &x) && yyjson_od_get_arr(&x, &it3));
-    while (yyjson_od_arr_next(&it3, &x)) {} /* completed: handoff */
-    CHECK(yyjson_od_obj_find(&it2, "b", 1, &x) && yyjson_od_get_uint(&x, &u64) && u64 == 6);
-    CHECK(yyjson_od_arr_next(&it, &v)); /* [7] unread */
-    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_uint(&v, &u64) && u64 == 8);
-    CHECK(!yyjson_od_arr_next(&it, &v) && yyjson_od_doc_finish(d));
 
     /* type errors are sticky */
     d = P_parse("{\"a\":\"s\",\"b\":1}", buf);
@@ -313,9 +283,8 @@ static void unit(void) {
     CHECK(yyjson_od_get_obj(&r, &it));
     CHECK(yyjson_od_obj_find(&it, "a", 1, &v));
     CHECK(!yyjson_od_get_sint(&v, &i64));
-    CHECK(yyjson_od_obj_find(&it, "b", 1, &v)); /* iteration may go on */
+    CHECK(!yyjson_od_obj_find(&it, "b", 1, &v));
     CHECK(!yyjson_od_doc_finish(d));
-    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_INCORRECT_TYPE);
 
     /* malformed inside a skipped value: like simdjson On Demand, skipped
        content is only bracket-balanced, not validated (documented) */
@@ -354,7 +323,9 @@ static void unit(void) {
     CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_sint(&v, &i64) && (uint64_t)i64 == (uint64_t)1 << 63);
     CHECK(yyjson_od_arr_next(&it, &v) && !yyjson_od_get_sint(&v, &i64)); /* > INT64_MAX */
     CHECK(yyjson_od_doc_err(d) == YYJSON_OD_INCORRECT_TYPE);
-    /* errors are sticky: the first one stays, finish fails */
+    /* errors poison the cursor: everything fails afterwards */
+    CHECK(!yyjson_od_arr_next(&it, &v));
+    CHECK(!yyjson_od_get_real(&v, &f));
     CHECK(!yyjson_od_doc_finish(d));
     CHECK(yyjson_od_doc_err(d) == YYJSON_OD_INCORRECT_TYPE);
     CHECK(strlen(yyjson_od_err_msg(YYJSON_OD_INCORRECT_TYPE)) > 0);
