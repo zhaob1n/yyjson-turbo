@@ -4826,14 +4826,20 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #undef return_err
 }
 
-/* Code placement of the optional readers, chosen per compiler by dynamic
-   instruction counts: clang allocates registers better for the default
-   reader when the new code is out of line, gcc when it is inlined. */
+/* Code placement of the optional readers. Keeping the new code out of line
+   is faster for both gcc and clang on real hardware (i5-12600KF, perf
+   cycles): inlining it into the gcc reader kept the instruction count equal
+   but cost 3-7% cycles on short-string documents (instruments, twitter). */
 #ifndef YYJSON_READ_OUTLINE
+#  define YYJSON_READ_OUTLINE 1
+#endif
+/* Bytes scanned by the scalar loop before the vector scan is tried. gcc's
+   reader loses cycles when 16-48 byte strings enter the vector scan. */
+#ifndef YYJSON_READ_SIMD_GATE
 #  if defined(__clang__)
-#    define YYJSON_READ_OUTLINE 1
+#    define YYJSON_READ_SIMD_GATE 16
 #  else
-#    define YYJSON_READ_OUTLINE 0
+#    define YYJSON_READ_SIMD_GATE 32
 #  endif
 #endif
 #if YYJSON_READ_OUTLINE
@@ -4942,7 +4948,12 @@ skip_ascii:
 #if YYJSON_STR_SIMD_AVX512
     if (eof - src >= 64) src = skip_ascii_simd(src, eof);
 #elif YYJSON_STR_SIMD_AVX2
-    if (eof - src >= 32) src = skip_ascii_simd(src, eof);
+#if YYJSON_READ_SIMD_GATE > 16
+    if (src - hdr >= YYJSON_READ_SIMD_GATE && eof - src >= 32)
+#else
+    if (eof - src >= 32)
+#endif
+        src = skip_ascii_simd(src, eof);
 #endif
     goto skip_ascii;
     repeat16_incr(expr_stop)
