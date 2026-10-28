@@ -202,22 +202,9 @@ int yyjson_od_iterate(yyjson_od_parser *p, const char *buf, size_t len,
     return YYJSON_OD_OK;
 }
 
-bool yyjson_od__fail(yyjson_od_doc *d, int code) {
-    if (!d->err) {
-        d->err = code;
-        d->err_tok = d->ip;
-    }
-    /* Poison the cursor: no handle matches it, and depth 0 makes every
-       iterator step fail. Sentinels keep reads at ntok in bounds. */
-    d->ip = d->ntok;
-    d->depth = 0;
-    return false;
-}
-
-bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target) {
-    const unsigned char *buf = d->buf;
-    const uint32_t *idx = d->idx;
-    uint32_t ip = d->ip, n = d->ntok, depth = d->depth;
+uint64_t yyjson_od__skip(const unsigned char *buf, const uint32_t *idx,
+                         uint32_t n, uint32_t ip, uint32_t depth,
+                         uint32_t target) {
     /* bounds are checked once per 4 tokens: the 4 sentinels at ntok keep
        the over-read in bounds, and ip > ntok is caught below */
     while (ip + 4 <= n) {
@@ -229,20 +216,15 @@ bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target) {
 #undef OD_SKIP_STEP
     }
     while (depth > target) {
-        if (yyjson_od_unlikely(ip >= n)) {
-            d->ip = ip;
-            d->depth = depth;
-            return yyjson_od__fail(d, YYJSON_OD_TAPE);
-        }
+        if (yyjson_od_unlikely(ip >= n))
+            return ip | ((uint64_t)(target + 1) << 32);
         depth = (uint32_t)((int32_t)depth + yyjson_od__dtab[buf[idx[ip]]]);
         ip++;
     }
 done:
-    d->ip = ip;
-    d->depth = depth;
     if (yyjson_od_unlikely(depth != target)) /* unbalanced brackets */
-        return yyjson_od__fail(d, YYJSON_OD_TAPE);
-    return true;
+        return ip | ((uint64_t)(target + 1) << 32);
+    return ip | ((uint64_t)depth << 32);
 }
 
 bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t e) {
@@ -266,16 +248,28 @@ bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
     return true;
 }
 
-bool yyjson_od__num_slow(yyjson_od_doc *d, uint32_t tok, yyjson_val *out) {
-    const unsigned char *p = d->buf + d->idx[tok], *e;
+yyjson_od__nr yyjson_od__numv(const unsigned char *p,
+                              const unsigned char *nx,
+                              const unsigned char *eof) {
+    yyjson_od__nr r;
+    yyjson_val v;
+    const unsigned char *e;
     unsigned char c = *p;
-    if (c != '-' && (unsigned char)(c - '0') > 9)
-        return yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE);
-    e = yyjson_od__num(p, d->buf + d->len, out);
-    if (!e) return yyjson_od__fail(d, YYJSON_OD_NUMBER);
-    if (e != d->buf + d->idx[tok + 1] && !YYJSON_OD_WS(*e))
-        return yyjson_od__fail(d, YYJSON_OD_NUMBER);
-    return true;
+    r.tag = 0;
+    r.u = 0;
+    r.err = 0;
+    if (c != '-' && (unsigned char)(c - '0') > 9) {
+        r.err = YYJSON_OD_INCORRECT_TYPE;
+        return r;
+    }
+    e = yyjson_od__num(p, eof, &v);
+    if (!e || (e != nx && !YYJSON_OD_WS(*e))) {
+        r.err = YYJSON_OD_NUMBER;
+        return r;
+    }
+    r.tag = v.tag;
+    r.u = v.uni.u64;
+    return r;
 }
 
 size_t yyjson_od_count(yyjson_od_val *v) {

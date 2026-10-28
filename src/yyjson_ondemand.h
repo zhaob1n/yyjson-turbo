@@ -214,14 +214,63 @@ yyjson_api const unsigned char *yyjson_od__num(const unsigned char *cur,
 __attribute__((const))
 #endif
 yyjson_api uint64_t yyjson_od__f64(uint64_t sig, int32_t exp, int sign);
-yyjson_api bool yyjson_od__fail(yyjson_od_doc *d, int code);
-yyjson_api bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target);
+/* The out-of-line helpers below never receive the doc: they take the
+   buffer/index by value and return results by value, and are declared
+   pure/const. A call on a cold path then cannot clobber the caller's doc,
+   so buf/idx/ntok stay in registers across iterator loops. */
+#if defined(__GNUC__) || defined(__clang__)
+#   define YYJSON_OD_PURE __attribute__((pure))
+#else
+#   define YYJSON_OD_PURE
+#endif
+/* skip tokens from `ip` at `depth` until depth <= target: returns
+   ip | depth << 32 (depth != target on failure) */
+YYJSON_OD_PURE yyjson_api uint64_t yyjson_od__skip(const unsigned char *buf,
+                                                   const uint32_t *idx,
+                                                   uint32_t ntok, uint32_t ip,
+                                                   uint32_t depth,
+                                                   uint32_t target);
+/* full number parse of [p, next token): err 0 on success */
+typedef struct yyjson_od__nr { uint64_t tag, u; int err; } yyjson_od__nr;
+YYJSON_OD_PURE yyjson_api yyjson_od__nr yyjson_od__numv(
+    const unsigned char *p, const unsigned char *nx, const unsigned char *eof);
 yyjson_api bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s,
                                      uint32_t e);
 yyjson_api bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
                                     yyjson_od_str *out);
-yyjson_api bool yyjson_od__num_slow(yyjson_od_doc *d, uint32_t tok,
-                                    yyjson_val *out);
+
+/* Record the first error and poison the cursor: no handle matches it, and
+   depth 0 makes every iterator step fail. Sentinels keep reads at ntok in
+   bounds. Inline (not a call that would take the doc's address). */
+yyjson_api_inline bool yyjson_od__fail(yyjson_od_doc *d, int code) {
+    if (!d->err) {
+        d->err = code;
+        d->err_tok = d->ip;
+    }
+    d->ip = d->ntok;
+    d->depth = 0;
+    return false;
+}
+
+yyjson_api_inline bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target) {
+    uint64_t r = yyjson_od__skip(d->buf, d->idx, d->ntok, d->ip, d->depth,
+                                 target);
+    d->ip = (uint32_t)r;
+    d->depth = (uint32_t)(r >> 32);
+    if (d->depth != target) return yyjson_od__fail(d, YYJSON_OD_TAPE);
+    return true;
+}
+
+yyjson_api_inline bool yyjson_od__num_slow(yyjson_od_doc *d, uint32_t tok,
+                                           yyjson_val *out) {
+    yyjson_od__nr r = yyjson_od__numv(d->buf + d->idx[tok],
+                                      d->buf + d->idx[tok + 1],
+                                      d->buf + d->len);
+    if (r.err) return yyjson_od__fail(d, r.err);
+    out->tag = r.tag;
+    out->uni.u64 = r.u;
+    return true;
+}
 
 #define YYJSON_OD_CH(d, t) ((d)->buf[(d)->idx[t]])
 
