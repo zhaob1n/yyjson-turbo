@@ -487,6 +487,12 @@ template <class T> static void run(Ctx &c, const char *task, const Input &in, in
 
 int main(int argc, char **argv) {
   CHECK(argc >= 2);
+  if (getenv("SJ_IMPL")) { /* force a simdjson kernel, e.g. haswell */
+    auto *im = simdjson::get_available_implementations()[getenv("SJ_IMPL")];
+    CHECK(im && im->supported_by_runtime_system());
+    simdjson::get_active_implementation() = im;
+  }
+  fprintf(stderr, "simdjson kernel: %s\n", simdjson::get_active_implementation()->name().c_str());
   std::string dir = argv[1]; int rounds = argc > 2 ? atoi(argv[2]) : 15; const char *flt = argc > 3 ? argv[3] : "";
   FILE *raw = fopen("bench_od_raw.tsv", "w");
   Ctx c;

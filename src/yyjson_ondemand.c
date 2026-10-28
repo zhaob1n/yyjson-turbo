@@ -256,7 +256,7 @@ bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t e) {
 bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
                          yyjson_od_str *out) {
     unsigned char *dst = d->scr, *end;
-    if ((size_t)(d->scr_end - dst) < (size_t)(e - s) + 8)
+    if ((size_t)(d->scr_end - dst) < (size_t)(e - s) + 40)
         return yyjson_od__fail(d, YYJSON_OD_MEMORY); /* only on re-reads */
     end = yyjson_od__str_esc(d->buf + s, d->buf + e, dst);
     if (!end) return yyjson_od__fail(d, YYJSON_OD_STRING);

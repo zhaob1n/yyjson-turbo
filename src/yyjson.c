@@ -6953,18 +6953,33 @@ static_inline u64 s1_block_od(const u8 *p, u64 *next_esc, u64 *prev_in,
     op = _mm512_cmpeq_epi8_mask(_mm512_or_si512(z, _mm512_set1_epi8(0x20)),
                                 _mm512_shuffle_epi8(ot, z));
     qt = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('"'));
-    bs = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('\\'));
     ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
-    if (likely(!_mm512_movepi8_mask(z))) {
-        /* ASCII block (simdjson: error |= prev_incomplete); a stale prev
-           block that ended complete is equivalent to an ASCII one */
-        u->err = _mm256_or_si256(u->err, u->inc);
-    } else if (*nna >= S1_ZUTF8_MIN) {
-        s1_utf8_stepz(u, z);
-    } else {
-        (*nna)++;
-        s1_utf8_step(u, _mm512_castsi512_si256(z));
-        s1_utf8_step(u, _mm512_extracti64x4_epi64(z, 1));
+    {
+        __mmask64 bk = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('\\'));
+        __mmask64 hk = _mm512_movepi8_mask(z);
+        bs = (u64)bk;
+        /* one folded test (kortest) for the common block: ASCII and no
+           backslash; a carried escape needs no slow path (simdjson) */
+        if (likely(_kortestz_mask64_u8(bk, hk))) {
+            escaped = *next_esc;
+            *next_esc = 0;
+            u->err = _mm256_or_si256(u->err, u->inc);
+            goto tail;
+        }
+        if (!(u64)hk) {
+            u->err = _mm256_or_si256(u->err, u->inc);
+        } else {
+            /* zmm UTF-8 from the first block: the ondemand stage 1 keeps
+               no block counter, to stay free of GPR spills */
+            (void)nna;
+            s1_utf8_stepz(u, z);
+        }
+        if (!bs) {
+            escaped = *next_esc;
+            *next_esc = 0;
+            goto tail;
+        }
+        goto esc;
     }
 #else
     const __m256i wtab = S1_T16(' ', 100, 100, 100, 17, 100, 113, 2, 100,
@@ -6975,6 +6990,8 @@ static_inline u64 s1_block_od(const u8 *p, u64 *next_esc, u64 *prev_in,
     const __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
     __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)p);
     __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+    __m256i ba = _mm256_cmpeq_epi8(a, vb), bb = _mm256_cmpeq_epi8(b, vb);
+    __m256i ab = _mm256_or_si256(a, b);
     ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
                 _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(wtab, b)));
     op = s1_mm2(_mm256_cmpeq_epi8(_mm256_or_si256(a, v20),
@@ -6982,26 +6999,40 @@ static_inline u64 s1_block_od(const u8 *p, u64 *next_esc, u64 *prev_in,
                 _mm256_cmpeq_epi8(_mm256_or_si256(b, v20),
                                   _mm256_shuffle_epi8(otab, b)));
     qt = s1_mm2(_mm256_cmpeq_epi8(a, vq), _mm256_cmpeq_epi8(b, vq));
-    bs = s1_mm2(_mm256_cmpeq_epi8(a, vb), _mm256_cmpeq_epi8(b, vb));
     ctrl = s1_mm2(_mm256_cmpeq_epi8(_mm256_min_epu8(a, v1f), a),
                   _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
     (void)nna;
-    if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
-        u->err = _mm256_or_si256(u->err, u->inc);
-    } else {
-        s1_utf8_step(u, a);
-        s1_utf8_step(u, b);
-    }
-#endif
-    if (likely(!bs)) {
+    /* one folded test: high bit of any byte, or any backslash */
+    if (likely(!(_mm256_movemask_epi8(_mm256_or_si256(ab,
+            _mm256_or_si256(ba, bb)))))) {
         escaped = *next_esc;
         *next_esc = 0;
+        u->err = _mm256_or_si256(u->err, u->inc);
     } else {
+        bs = s1_mm2(ba, bb);
+        if (_mm256_movemask_epi8(ab) == 0) {
+            u->err = _mm256_or_si256(u->err, u->inc);
+        } else {
+            s1_utf8_step(u, a);
+            s1_utf8_step(u, b);
+        }
+        if (!bs) {
+            escaped = *next_esc;
+            *next_esc = 0;
+            goto tail;
+        }
+        goto esc;
+    }
+#endif
+    goto tail;
+esc:
+    {
         u64 pe = bs & ~*next_esc;
         u64 ec = (((pe << 1) | S1_ODD) - pe) ^ S1_ODD;
         escaped = ec ^ (bs | *next_esc);
         *next_esc = (ec & bs) >> 63;
     }
+tail:
     quote = qt & ~escaped;
     in_str = s1_prefix_xor(quote) ^ *prev_in;
     *prev_in = (u64)((i64)in_str >> 63);
@@ -7018,27 +7049,46 @@ static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
     u64 prev_st = 0, st, cerr = 0, next_esc = 0, prev_in = 0, prev_scalar = 0;
     u32 prev_base = 0;
     u32 *out = idx;
-    usize pos = 0, nna = 0, full = len & ~(usize)63;
+    usize nna = 0, full = len & ~(usize)63;
+    const u8 *p = buf, *pend = buf + full;
     u8 tmp[64];
     s1_utf8 u;
     bool utf8_ok;
     u.prev = u.err = u.inc = _mm256_setzero_si256();
-    for (; pos < full; pos += 64) {
-        st = s1_block_od(buf + pos, &next_esc, &prev_in, &prev_scalar, &u,
-                         &nna, &cerr);
-        /* bit_indexer: write the previous block while this one is scanned */
-        out = s1_write(out, prev_base, prev_st);
+    /* bit_indexer: write the previous block while this one is scanned; the
+       previous base is derived from p so no extra register is carried */
+    if (p < pend) {
+        st = s1_block_od(p, &next_esc, &prev_in, &prev_scalar, &u, &nna,
+                         &cerr);
+        p += 64;
+        /* unrolled by two so the carried masks need no register rotation */
+        for (; pend - p >= 128; p += 128) {
+            u64 c1, c2;
+            c1 = s1_block_od(p, &next_esc, &prev_in, &prev_scalar, &u, &nna,
+                             &cerr);
+            out = s1_write(out, (u32)(usize)(p - buf) - 64, st);
+            c2 = s1_block_od(p + 64, &next_esc, &prev_in, &prev_scalar, &u,
+                             &nna, &cerr);
+            out = s1_write(out, (u32)(usize)(p - buf), c1);
+            st = c2;
+        }
+        if (p < pend) {
+            u64 cur = s1_block_od(p, &next_esc, &prev_in, &prev_scalar, &u,
+                                  &nna, &cerr);
+            out = s1_write(out, (u32)(usize)(p - buf) - 64, st);
+            st = cur;
+        }
         prev_st = st;
-        prev_base = (u32)pos;
+        prev_base = (u32)(full - 64);
     }
-    if (pos < len) {
+    if (full < len) {
         memset(tmp, ' ', 64);
-        memcpy(tmp, buf + pos, len - pos);
+        memcpy(tmp, buf + full, len - full);
         st = s1_block_od(tmp, &next_esc, &prev_in, &prev_scalar, &u, &nna,
                          &cerr);
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
-        prev_base = (u32)pos;
+        prev_base = (u32)full;
     }
     out = s1_write(out, prev_base, prev_st);
     if (prev_in || cerr) return false;
@@ -7867,7 +7917,7 @@ yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx,
 yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out);
 yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
                                     yyjson_val *val);
-yyjson_api bool yyjson_od__f64(u64 sig, i32 exp, bool sign, yyjson_val *val);
+yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign);
 
 /* Drop const without -Wcast-qual noise: the readers never write here. */
 static_inline u8 *od_unconst(const u8 *p) {
@@ -7893,56 +7943,97 @@ static_inline bool od_hex4(const u8 *p, u32 *cp) {
     *cp = v;
     return true;
 }
-/* Portable unescape of [beg, end) into out (out may equal beg). UTF-8 was
-   validated by stage 1. Returns the written NUL terminator or NULL. */
+/* One escape sequence at src (src[0] is a backslash, src < end): decodes
+   into *pdst, returns the new src or NULL. */
+static_inline const u8 *od_esc1(const u8 *src, const u8 *end, u8 **pdst) {
+    u8 *dst = *pdst;
+    u32 cp, lo;
+    if (end - src < 2) return NULL;
+    switch (src[1]) {
+        case '"':  *dst++ = '"';  src += 2; break;
+        case '\\': *dst++ = '\\'; src += 2; break;
+        case '/':  *dst++ = '/';  src += 2; break;
+        case 'b':  *dst++ = '\b'; src += 2; break;
+        case 'f':  *dst++ = '\f'; src += 2; break;
+        case 'n':  *dst++ = '\n'; src += 2; break;
+        case 'r':  *dst++ = '\r'; src += 2; break;
+        case 't':  *dst++ = '\t'; src += 2; break;
+        case 'u':
+            if (end - src < 6 || !od_hex4(src + 2, &cp)) return NULL;
+            src += 6;
+            if ((cp & 0xFC00) == 0xD800) {
+                if (end - src < 6 || src[0] != '\\' || src[1] != 'u' ||
+                    !od_hex4(src + 2, &lo) || (lo & 0xFC00) != 0xDC00)
+                    return NULL;
+                src += 6;
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            } else if ((cp & 0xFC00) == 0xDC00) {
+                return NULL;
+            }
+            if (cp < 0x80) {
+                *dst++ = (u8)cp;
+            } else if (cp < 0x800) {
+                *dst++ = (u8)(0xC0 | (cp >> 6));
+                *dst++ = (u8)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                *dst++ = (u8)(0xE0 | (cp >> 12));
+                *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
+                *dst++ = (u8)(0x80 | (cp & 0x3F));
+            } else {
+                *dst++ = (u8)(0xF0 | (cp >> 18));
+                *dst++ = (u8)(0x80 | ((cp >> 12) & 0x3F));
+                *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
+                *dst++ = (u8)(0x80 | (cp & 0x3F));
+            }
+            break;
+        default: return NULL;
+    }
+    *pdst = dst;
+    return src;
+}
+
+/* Unescape [beg, end) into out (a separate scratch buffer). UTF-8 and the
+   absence of raw control characters were validated by stage 1. With AVX2
+   (simdjson's parse_string scheme): copy 32 bytes at a time and use the
+   backslash bitmask to find the next escape; runs of four BMP \uXXXX are
+   decoded with one SSE step. Reads up to 32 bytes past `end` (inside the
+   input padding) and writes up to 32 bytes past the result (inside the
+   scratch slack). Returns the written NUL terminator or NULL. */
 yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out) {
     const u8 *src = beg;
     u8 *dst = out;
-    u32 cp, lo;
+#if S1_AVX2
+    const __m256i vb = _mm256_set1_epi8('\\');
     while (src < end) {
-        u8 c = *src;
-        if (c >= 0x20 && c != '\\') { *dst++ = c; src++; continue; }
-        if (c < 0x20 || end - src < 2) return NULL;
-        switch (src[1]) {
-            case '"':  *dst++ = '"';  src += 2; break;
-            case '\\': *dst++ = '\\'; src += 2; break;
-            case '/':  *dst++ = '/';  src += 2; break;
-            case 'b':  *dst++ = '\b'; src += 2; break;
-            case 'f':  *dst++ = '\f'; src += 2; break;
-            case 'n':  *dst++ = '\n'; src += 2; break;
-            case 'r':  *dst++ = '\r'; src += 2; break;
-            case 't':  *dst++ = '\t'; src += 2; break;
-            case 'u':
-                if (end - src < 6 || !od_hex4(src + 2, &cp)) return NULL;
-                src += 6;
-                if ((cp & 0xFC00) == 0xD800) {
-                    if (end - src < 6 || src[0] != '\\' || src[1] != 'u' ||
-                        !od_hex4(src + 2, &lo) || (lo & 0xFC00) != 0xDC00)
-                        return NULL;
-                    src += 6;
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                } else if ((cp & 0xFC00) == 0xDC00) {
-                    return NULL;
-                }
-                if (cp < 0x80) {
-                    *dst++ = (u8)cp;
-                } else if (cp < 0x800) {
-                    *dst++ = (u8)(0xC0 | (cp >> 6));
-                    *dst++ = (u8)(0x80 | (cp & 0x3F));
-                } else if (cp < 0x10000) {
-                    *dst++ = (u8)(0xE0 | (cp >> 12));
-                    *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
-                    *dst++ = (u8)(0x80 | (cp & 0x3F));
-                } else {
-                    *dst++ = (u8)(0xF0 | (cp >> 18));
-                    *dst++ = (u8)(0x80 | ((cp >> 12) & 0x3F));
-                    *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
-                    *dst++ = (u8)(0x80 | (cp & 0x3F));
-                }
-                break;
-            default: return NULL;
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
+        u32 m = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vb));
+        usize rem = (usize)(end - src), n;
+        _mm256_storeu_si256((__m256i *)(void *)dst, v);
+        n = m ? (usize)__builtin_ctz(m) : 32;
+        if (n >= rem) { dst += rem; break; }
+        src += n; dst += n;
+        if (n == 32) continue;
+        while (end - src >= 24 && s1_is_u(src) && s1_is_u(src + 6) &&
+               s1_is_u(src + 12) && s1_is_u(src + 18) &&
+               s1_u4_bmp3(src, dst)) {
+            src += 24; dst += 12;
+        }
+        if (src < end && *src == '\\') {
+            src = od_esc1(src, end, &dst);
+            if (!src) return NULL;
         }
     }
+#else
+    while (src < end) {
+        u8 c = *src;
+        if (c != '\\') {
+            if (c < 0x20) return NULL;
+            *dst++ = c; src++; continue;
+        }
+        src = od_esc1(src, end, &dst);
+        if (!src) return NULL;
+    }
+#endif
     *dst = '\0';
     return dst;
 }
@@ -7963,8 +8054,14 @@ yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
     return p;
 }
 
-yyjson_api bool yyjson_od__f64(u64 sig, i32 exp, bool sign, yyjson_val *val) {
-    return s1_f64_conv(sig, exp, sign, val);
+/* Bits of the double, or ~0 (a NaN the conversion never yields) when the
+   generic reader must decide. Touches no caller-visible memory, so the
+   header can declare it `const` and the caller's cursor stays in
+   registers across the call. */
+yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign) {
+    yyjson_val v;
+    if (!s1_f64_conv(sig, exp, sign != 0, &v)) return ~(u64)0;
+    return v.uni.u64;
 }
 #endif /* YYJSON_DISABLE_STAGE1 */
 

@@ -210,8 +210,10 @@ yyjson_api unsigned char *yyjson_od__str_esc(const unsigned char *beg,
 yyjson_api const unsigned char *yyjson_od__num(const unsigned char *cur,
                                                const unsigned char *eof,
                                                yyjson_val *val);
-yyjson_api bool yyjson_od__f64(uint64_t sig, int32_t exp, bool sign,
-                               yyjson_val *val);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((const))
+#endif
+yyjson_api uint64_t yyjson_od__f64(uint64_t sig, int32_t exp, int sign);
 yyjson_api bool yyjson_od__fail(yyjson_od_doc *d, int code);
 yyjson_api bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target);
 yyjson_api bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s,
@@ -786,7 +788,10 @@ yyjson_api_inline const unsigned char *yyjson_od__pnum(const unsigned char *p,
 #else
     (void)pow10;
 #endif
-    if (!yyjson_od__f64(sig, e, neg != 0, v)) return NULL;
+    x = yyjson_od__f64(sig, e, neg);
+    if (yyjson_od_unlikely(x == ~(uint64_t)0)) return NULL;
+    v->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
+    v->uni.u64 = x;
     return p;
 }
 
