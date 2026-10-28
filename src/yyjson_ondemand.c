@@ -227,20 +227,22 @@ done:
     return ip | ((uint64_t)depth << 32);
 }
 
-bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t e) {
+bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t bs,
+                          uint32_t e) {
     yyjson_od_str tmp;
     unsigned char *save = d->scr;
-    if (!yyjson_od__str_slow(d, s, e, &tmp)) return false;
+    if (!yyjson_od__str_slow(d, s, bs, e, &tmp)) return false;
     d->scr = save; /* decoded form is discarded */
     return true;
 }
 
-bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
-                         yyjson_od_str *out) {
+bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t bs,
+                         uint32_t e, yyjson_od_str *out) {
     unsigned char *dst = d->scr, *end;
     if ((size_t)(d->scr_end - dst) < (size_t)(e - s) + 40)
         return yyjson_od__fail(d, YYJSON_OD_MEMORY); /* only on re-reads */
-    end = yyjson_od__str_esc(d->buf + s, d->buf + e, dst);
+    end = yyjson_od__str_esc2(d->buf + s, d->buf + (bs < e ? bs : e),
+                              d->buf + e, dst);
     if (!end) return yyjson_od__fail(d, YYJSON_OD_STRING);
     out->ptr = (const char *)dst;
     out->len = (size_t)(end - dst);

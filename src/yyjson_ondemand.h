@@ -207,6 +207,10 @@ yyjson_api bool yyjson_od__index(const unsigned char *buf, size_t len,
 yyjson_api unsigned char *yyjson_od__str_esc(const unsigned char *beg,
                                              const unsigned char *end,
                                              unsigned char *out);
+yyjson_api unsigned char *yyjson_od__str_esc2(const unsigned char *beg,
+                                              const unsigned char *bs,
+                                              const unsigned char *end,
+                                              unsigned char *out);
 yyjson_api const unsigned char *yyjson_od__num(const unsigned char *cur,
                                                const unsigned char *eof,
                                                yyjson_val *val);
@@ -234,10 +238,11 @@ YYJSON_OD_PURE yyjson_api uint64_t yyjson_od__skip(const unsigned char *buf,
 typedef struct yyjson_od__nr { uint64_t tag, u; int err; } yyjson_od__nr;
 YYJSON_OD_PURE yyjson_api yyjson_od__nr yyjson_od__numv(
     const unsigned char *p, const unsigned char *nx, const unsigned char *eof);
+/* `bs` <= first backslash offset (the scanner's stop point) */
 yyjson_api bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s,
-                                     uint32_t e);
-yyjson_api bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
-                                    yyjson_od_str *out);
+                                     uint32_t bs, uint32_t e);
+yyjson_api bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t bs,
+                                    uint32_t e, yyjson_od_str *out);
 
 /* Record the first error and poison the cursor: no handle matches it, and
    depth 0 makes every iterator step fail. Sentinels keep reads at ntok in
@@ -316,7 +321,8 @@ yyjson_api_inline uint32_t yyjson_od__str_end(const yyjson_od_doc *d,
    the same way, at string read time); the closing quote exists (stage 1
    checked it) and the padding keeps the loads in bounds. */
 yyjson_api_inline uint32_t yyjson_od__str_scan(const yyjson_od_doc *d,
-                                               uint32_t tok, uint32_t s) {
+                                               uint32_t tok, uint32_t s,
+                                               uint32_t *bs) {
     const unsigned char *buf = d->buf;
     uint32_t e, nx;
 #if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
@@ -354,7 +360,9 @@ yyjson_api_inline uint32_t yyjson_od__str_scan(const yyjson_od_doc *d,
     e = s;
     while (buf[e] != '"' && buf[e] != '\\') e++;
 #endif
+    *bs = e; /* no backslash before e */
     if (yyjson_od_unlikely(buf[e] != '"')) return 0;
+    *bs = s;
     nx = d->idx[tok + 1];
     if (yyjson_od_likely(e + 1 == nx)) return e;
     return yyjson_od__str_end(d, tok) == e ? e : 0;
@@ -499,7 +507,7 @@ yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
                                           yyjson_od_str *key,
                                           yyjson_od_val *val) {
     yyjson_od_doc *d = it->doc;
-    uint32_t ip, s, e;
+    uint32_t ip, s, e, bs;
     if (!yyjson_od__sep(it, '}')) return false;
     ip = d->ip;
     if (yyjson_od_unlikely(ip + 2 >= d->ntok ||
@@ -510,14 +518,14 @@ yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
         return yyjson_od__fail(d, YYJSON_OD_TAPE);
     }
     s = d->idx[ip] + 1;
-    e = yyjson_od__str_scan(d, ip, s);
+    e = yyjson_od__str_scan(d, ip, s, &bs);
     if (yyjson_od_unlikely(!e)) {
         e = yyjson_od__str_end(d, ip);
         if (!e) {
             it->state = 2;
             return yyjson_od__fail(d, YYJSON_OD_TAPE);
         }
-        if (!yyjson_od__key_check(d, s, e)) {
+        if (!yyjson_od__key_check(d, s, bs, e)) {
             it->state = 2;
             return false;
         }
@@ -701,19 +709,19 @@ yyjson_api_inline yyjson_od_type yyjson_od_get_type(const yyjson_od_val *v) {
 yyjson_api_inline bool yyjson_od_get_str(yyjson_od_val *v, yyjson_od_str *out) {
     yyjson_od_doc *d = v->doc;
     int pos = yyjson_od__pos(v);
-    uint32_t s, e;
+    uint32_t s, e, bs;
     if (yyjson_od_unlikely(!pos)) return false;
     if (yyjson_od_unlikely(YYJSON_OD_CH(d, v->tok) != '"'))
         return yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE);
     s = d->idx[v->tok] + 1;
-    e = yyjson_od__str_scan(d, v->tok, s);
+    e = yyjson_od__str_scan(d, v->tok, s, &bs);
     if (yyjson_od_likely(e)) {
         out->ptr = (const char *)d->buf + s;
         out->len = (size_t)(e - s);
     } else {
         e = yyjson_od__str_end(d, v->tok);
         if (yyjson_od_unlikely(!e)) return yyjson_od__fail(d, YYJSON_OD_TAPE);
-        if (!yyjson_od__str_slow(d, s, e, out)) return false;
+        if (!yyjson_od__str_slow(d, s, bs, e, out)) return false;
     }
     if (pos == 1) d->ip++;
     return true;

@@ -7915,6 +7915,8 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
 yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx,
                                  usize *ntok);
 yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out);
+yyjson_api u8 *yyjson_od__str_esc2(const u8 *beg, const u8 *bs,
+                                   const u8 *end, u8 *out);
 yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
                                     yyjson_val *val);
 yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign);
@@ -8000,10 +8002,22 @@ static_inline const u8 *od_esc1(const u8 *src, const u8 *end, u8 **pdst) {
    input padding) and writes up to 32 bytes past the result (inside the
    scratch slack). Returns the written NUL terminator or NULL. */
 yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out) {
+    return yyjson_od__str_esc2(beg, beg, end, out);
+}
+
+/* Like yyjson_od__str_esc, but [beg, bs) is known to hold no backslash
+   (the scanner stopped at `bs`), so the vector path copies it unscanned. */
+yyjson_api u8 *yyjson_od__str_esc2(const u8 *beg, const u8 *bs,
+                                   const u8 *end, u8 *out) {
     const u8 *src = beg;
     u8 *dst = out;
 #if S1_AVX2
     const __m256i vb = _mm256_set1_epi8('\\');
+    while (src + 32 <= bs) {
+        _mm256_storeu_si256((__m256i *)(void *)dst,
+            _mm256_loadu_si256((const __m256i *)(const void *)src));
+        src += 32; dst += 32;
+    }
     while (src < end) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
         u32 m = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vb));
