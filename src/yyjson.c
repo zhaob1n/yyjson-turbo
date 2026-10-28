@@ -7651,6 +7651,41 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
     alc.free(alc.ctx, idx);
     return ret;
 }
+
+#if S1_AVX2
+/*==============================================================================
+ * Internal hooks for the On Demand prototype (src/yyjson_ondemand.c).
+ * Not part of the public API.
+ *============================================================================*/
+yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+                                 usize *ntok) {
+    bool utf8_ok = false;
+    if (!s1_index(buf, (u8 *)buf, len, idx, spc, ntok, &utf8_ok)) return false;
+    return utf8_ok;
+}
+
+yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
+                                  const u64 *spc, u8 *out) {
+    yyjson_val tmp;
+    return s1_str_esc((u8 *)hdr, (u8 *)beg, (u8 *)end, spc, &tmp, out);
+}
+
+yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
+                                    yyjson_val *val) {
+    u8 *p = (u8 *)cur;
+    u8 raw_end[1];
+    u8 *raw_ptr = raw_end;
+    u8 **pre = &raw_ptr;
+    const char *msg;
+#if !YYJSON_DISABLE_FAST_FP_CONV
+    if (s1_num(&p, (u8 *)eof, val)) return p;
+#else
+    (void)eof;
+#endif
+    if (!read_num(&p, pre, 0, val, &msg)) return NULL;
+    return p;
+}
+#endif /* S1_AVX2 */
 #endif /* YYJSON_DISABLE_STAGE1 */
 
 yyjson_doc *yyjson_read_opts(char *dat, usize len,
