@@ -254,6 +254,29 @@ static void unit(void) {
         CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
     }
 
+#if YYJSON_OD_CHECKS
+    /* development checks: reading ahead of the cursor */
+    d = P_parse("[[1,2],3]", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_arr(&r, &it));
+    CHECK(yyjson_od_arr_next(&it, &v));
+    {
+        yyjson_od_val ahead = v;
+        ahead.tok += 4; /* the element 3 */
+        CHECK(!yyjson_od_get_sint(&ahead, &i64));
+        CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
+    }
+    /* development checks: child iterator used after its parent moved on */
+    d = P_parse("[[1,2],[3]]", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_arr(&r, &it));
+    CHECK(yyjson_od_arr_next(&it, &v));
+    CHECK(yyjson_od_get_arr(&v, &it2));
+    CHECK(yyjson_od_arr_next(&it, &v)); /* skips the rest of [1,2] */
+    CHECK(!yyjson_od_arr_next(&it2, &v));
+    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_OUT_OF_ORDER);
+#endif
+
     /* type errors are sticky */
     d = P_parse("{\"a\":\"s\",\"b\":1}", buf);
     r = yyjson_od_doc_root(d);

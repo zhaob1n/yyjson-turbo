@@ -11,8 +11,16 @@
  *  - Cursor: a document has one forward-only cursor. A yyjson_od_val is a
  *    lightweight handle {doc, token}. Containers must be consumed in document
  *    order; a scalar that the cursor already passed may be re-read, a
- *    container may not (YYJSON_OD_OUT_OF_ORDER). yyjson_od_doc_rewind()
- *    restarts the iteration from the root.
+ *    container may not. yyjson_od_doc_rewind() restarts the iteration from
+ *    the root. Unread members and elements are skipped automatically.
+ *  - Misuse checks: like simdjson (SIMDJSON_DEVELOPMENT_CHECKS), detection
+ *    of out-of-order use (reading a value after the cursor moved past it,
+ *    using an iterator after its parent advanced) is compiled in only when
+ *    YYJSON_OD_CHECKS is defined to 1; misuse then fails with
+ *    YYJSON_OD_OUT_OF_ORDER. By default (0) correct programs behave exactly
+ *    the same, and misuse is memory-safe but its results are unspecified.
+ *    The macro only affects inline code: it may differ between the library
+ *    and the program.
  *  - Errors are sticky: after the first error every call fails and returns
  *    false. Check yyjson_od_doc_err() at the end (or after any false).
  *    "Not found" (yyjson_od_obj_find) and "not null" (yyjson_od_is_null) are
@@ -37,6 +45,9 @@
 #define YYJSON_ONDEMAND_H
 
 #include "yyjson.h"
+#if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
 #include <string.h>
 #include <float.h>
 
@@ -46,6 +57,11 @@ extern "C" {
 
 /** Number of readable bytes required after the end of the input. */
 #define YYJSON_OD_PADDING 64
+
+/** Misuse (out-of-order) detection, see above. Default: off. */
+#ifndef YYJSON_OD_CHECKS
+#define YYJSON_OD_CHECKS 0
+#endif
 
 /** Error codes (sticky in the document). */
 typedef enum yyjson_od_code {
@@ -76,7 +92,6 @@ typedef struct yyjson_od_doc {
     const unsigned char *buf;   /* input */
     const uint32_t *idx;        /* token offsets: structurals, opening quotes
                                    and scalar starts; sentinels at the end */
-    const uint64_t *spc;        /* per-64-byte masks of backslashes */
     unsigned char *scr;         /* scratch cursor for unescaped strings */
     unsigned char *scr_beg;     /* start of the scratch buffer */
     unsigned char *scr_end;     /* end of the scratch buffer */
@@ -101,7 +116,6 @@ typedef struct yyjson_od_val {
 typedef struct yyjson_od_iter {
     yyjson_od_doc *doc;
     uint32_t depth;             /* depth of the members */
-    uint32_t vtok;              /* value token of the last returned member */
     uint32_t otok;              /* first token after '{' / '[' */
     uint32_t state;             /* 0: before first, 1: in member, 2: done */
 } yyjson_od_iter;
@@ -189,11 +203,9 @@ extern const unsigned char yyjson_od__vtab[256]; /* may start a value */
 extern const unsigned char yyjson_od__ttab[256]; /* may end a number: ws , ] } */
 
 yyjson_api bool yyjson_od__index(const unsigned char *buf, size_t len,
-                                 uint32_t *idx, uint64_t *spc, size_t *ntok);
-yyjson_api unsigned char *yyjson_od__str_esc(const unsigned char *hdr,
-                                             const unsigned char *beg,
+                                 uint32_t *idx, size_t *ntok);
+yyjson_api unsigned char *yyjson_od__str_esc(const unsigned char *beg,
                                              const unsigned char *end,
-                                             const uint64_t *spc,
                                              unsigned char *out);
 yyjson_api const unsigned char *yyjson_od__num(const unsigned char *cur,
                                                const unsigned char *eof,
@@ -208,8 +220,6 @@ yyjson_api bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
                                     yyjson_od_str *out);
 yyjson_api bool yyjson_od__num_slow(yyjson_od_doc *d, uint32_t tok,
                                     yyjson_val *out);
-yyjson_api bool yyjson_od__find_slow(yyjson_od_iter *it, const char *key,
-                                     size_t klen, yyjson_od_val *val);
 
 #define YYJSON_OD_CH(d, t) ((d)->buf[(d)->idx[t]])
 
@@ -230,9 +240,13 @@ yyjson_api_inline int yyjson_od__pos(const yyjson_od_val *v) {
     yyjson_od_doc *d = v->doc;
     if (yyjson_od_likely(v->tok == d->ip)) return 1; /* ip is poisoned on error */
     if (d->err) return 0;
-    if (v->tok < d->ip) return 2;
-    yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
-    return 0;
+#if YYJSON_OD_CHECKS
+    if (v->tok > d->ip) {
+        yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+        return 0;
+    }
+#endif
+    return 2;
 }
 
 /* Offset of the closing quote of the string at token `tok` (0 if broken).
@@ -244,19 +258,55 @@ yyjson_api_inline uint32_t yyjson_od__str_end(const yyjson_od_doc *d,
     return (e > s && d->buf[e] == '"') ? e : 0;
 }
 
-/* True if a backslash lies in [a, b). */
-yyjson_api_inline bool yyjson_od__has_spc(const uint64_t *spc, size_t a,
-                                          size_t b) {
-    size_t wa, wb;
-    uint64_t ma, mb;
-    if (a >= b) return false;
-    wa = a >> 6; wb = (b - 1) >> 6;
-    ma = ~(uint64_t)0 << (a & 63);
-    mb = ~(uint64_t)0 >> (63 - ((b - 1) & 63));
-    if (yyjson_od_likely(wa == wb)) return (spc[wa] & ma & mb) != 0;
-    if (spc[wa] & ma) return true;
-    for (wa++; wa < wb; wa++) if (spc[wa]) return true;
-    return (spc[wb] & mb) != 0;
+/* Find the end of the string whose content starts at offset `s` of token
+   `tok`: returns the offset of the closing quote, or 0 if the string has
+   escapes (or the tape is broken), in which case the caller takes the slow
+   path. One forward pass, 8 bytes per step (simdjson finds escapes lazily
+   the same way, at string read time); the closing quote exists (stage 1
+   checked it) and the padding keeps the loads in bounds. */
+yyjson_api_inline uint32_t yyjson_od__str_scan(const yyjson_od_doc *d,
+                                               uint32_t tok, uint32_t s) {
+    const unsigned char *buf = d->buf;
+    uint32_t e, nx;
+#if defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
+    const __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
+    uint32_t m;
+    e = s;
+    for (;;) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(buf + e));
+        m = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(
+            _mm256_cmpeq_epi8(x, vq), _mm256_cmpeq_epi8(x, vb)));
+        if (m) break;
+        e += 32;
+    }
+    e += (uint32_t)__builtin_ctz(m);
+#elif (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const uint64_t k1 = ((uint64_t)0x01010101 << 32) | 0x01010101;
+    const uint64_t k80 = ((uint64_t)0x80808080 << 32) | 0x80808080;
+    const uint64_t kq = ((uint64_t)0x22222222 << 32) | 0x22222222;
+    const uint64_t kbs = ((uint64_t)0x5C5C5C5C << 32) | 0x5C5C5C5C;
+    uint64_t x, xq, xb, t;
+    e = s;
+    for (;;) {
+        memcpy(&x, buf + e, 8);
+        xq = x ^ kq;
+        xb = x ^ kbs;
+        /* the lowest set bit of each term is exact */
+        t = ((xq - k1) & ~xq) | ((xb - k1) & ~xb);
+        t &= k80;
+        if (t) break;
+        e += 8;
+    }
+    e += (uint32_t)(__builtin_ctzll(t) >> 3);
+#else
+    e = s;
+    while (buf[e] != '"' && buf[e] != '\\') e++;
+#endif
+    if (yyjson_od_unlikely(buf[e] != '"')) return 0;
+    nx = d->idx[tok + 1];
+    if (yyjson_od_likely(e + 1 == nx)) return e;
+    return yyjson_od__str_end(d, tok) == e ? e : 0;
 }
 
 /* Skip the value starting at the cursor (which must be at `depth`). */
@@ -270,18 +320,6 @@ yyjson_api_inline bool yyjson_od__skip_val(yyjson_od_doc *d, uint32_t depth) {
     return true;
 }
 
-/* Bring the cursor past the member whose value starts at `vtok` (members at
-   `depth`), skipping whatever of it was not read. */
-yyjson_api_inline bool yyjson_od__finish(yyjson_od_doc *d, uint32_t depth,
-                                         uint32_t vtok) {
-    if (yyjson_od_likely(d->depth == depth)) {
-        if (d->ip == vtok) return yyjson_od__skip_val(d, depth);
-        return true;
-    }
-    if (d->depth > depth) return yyjson_od__skip_to(d, depth);
-    return yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
-}
-
 yyjson_api_inline bool yyjson_od__begin(yyjson_od_val *v, yyjson_od_iter *it,
                                         unsigned char open,
                                         unsigned char close) {
@@ -291,7 +329,6 @@ yyjson_api_inline bool yyjson_od__begin(yyjson_od_val *v, yyjson_od_iter *it,
     it->state = 2;
     it->otok = ip + 1;
     it->depth = d->depth + 1;
-    it->vtok = 0;
     if (yyjson_od_unlikely(ip != d->ip)) {
         if (d->err) return false;
         return yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
@@ -311,22 +348,72 @@ yyjson_api_inline bool yyjson_od__begin(yyjson_od_val *v, yyjson_od_iter *it,
     return true;
 }
 
+/* Skip the member value at the cursor if it was not read: the cursor of an
+   iterator at its own depth is at a separator, or at an unread value (the
+   simdjson way: no per-member bookkeeping). 0 on error. */
+yyjson_api_inline int yyjson_od__skip_unread(yyjson_od_doc *d,
+                                             uint32_t depth,
+                                             unsigned char *cp) {
+    unsigned char c = *cp, prev = YYJSON_OD_CH(d, d->ip - 1);
+    /* an unread value directly follows ':' / ',' / an opening bracket;
+       anything else is a value after a consumed one (missing ',') */
+    if (yyjson_od_unlikely(prev != ':' && prev != ',' && prev != '[' &&
+                           prev != '{'))
+        return yyjson_od__fail(d, YYJSON_OD_TAPE);
+    d->ip++;
+    if (c == '{' || c == '[') {
+        d->depth++;
+        if (yyjson_od_unlikely(!yyjson_od__skip_to(d, depth))) return 0;
+    } else if (yyjson_od_unlikely(!yyjson_od__vtab[c])) {
+        d->ip--;
+        return yyjson_od__fail(d, YYJSON_OD_TAPE);
+    }
+    *cp = YYJSON_OD_CH(d, d->ip);
+    return 1;
+}
+
+/* Bring an iterator's cursor back to its depth: a child container that was
+   started but not finished is skipped. 0: the iterator is done. */
+yyjson_api_inline int yyjson_od__level(yyjson_od_iter *it) {
+    yyjson_od_doc *d = it->doc;
+    if (yyjson_od_likely(d->depth == it->depth)) return 1;
+    if (d->depth > it->depth) return yyjson_od__skip_to(d, it->depth);
+#if YYJSON_OD_CHECKS
+    /* the container ended without this iterator seeing it */
+    if (it->state != 2 && !d->err) {
+        it->state = 2;
+        yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+    }
+#endif
+    return 0; /* ended or error (depth 0) */
+}
+
 /* Move past the separator after the current member. 1: a member follows;
    0: end of the container or error. */
 yyjson_api_inline int yyjson_od__sep(yyjson_od_iter *it, unsigned char close) {
     yyjson_od_doc *d = it->doc;
     unsigned char c;
-    if (it->state != 1) {
+    if (yyjson_od_unlikely(it->state != 1)) {
         if (it->state == 0) { /* the caller validates the token */
             it->state = 1;
+#if YYJSON_OD_CHECKS
+            if (d->ip != it->otok || d->depth != it->depth) {
+                it->state = 2;
+                if (!d->err) yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+                return 0;
+            }
             return 1;
+#else
+            return d->depth == it->depth;
+#endif
         }
         return 0;
     }
-    /* on error depth is 0, so finish fails */
-    if (yyjson_od_unlikely(!yyjson_od__finish(d, it->depth, it->vtok)))
-        return 0;
+    if (yyjson_od_unlikely(!yyjson_od__level(it))) return 0;
     c = YYJSON_OD_CH(d, d->ip); /* sentinels keep this in bounds */
+    if (yyjson_od_unlikely(c != ',' && c != close) &&
+        !yyjson_od__skip_unread(d, it->depth, &c))
+        return 0;
     d->ip++;
     if (yyjson_od_likely(c == ',')) return 1;
     it->state = 2;
@@ -372,21 +459,22 @@ yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
         return yyjson_od__fail(d, YYJSON_OD_TAPE);
     }
     s = d->idx[ip] + 1;
-    e = yyjson_od__str_end(d, ip);
+    e = yyjson_od__str_scan(d, ip, s);
     if (yyjson_od_unlikely(!e)) {
-        it->state = 2;
-        return yyjson_od__fail(d, YYJSON_OD_TAPE);
+        e = yyjson_od__str_end(d, ip);
+        if (!e) {
+            it->state = 2;
+            return yyjson_od__fail(d, YYJSON_OD_TAPE);
+        }
+        if (!yyjson_od__key_check(d, s, e)) {
+            it->state = 2;
+            return false;
+        }
     }
     key->ptr = (const char *)d->buf + s;
     key->len = (size_t)(e - s);
-    if (yyjson_od_unlikely(yyjson_od__has_spc(d->spc, s, e)) &&
-        !yyjson_od__key_check(d, s, e)) {
-        it->state = 2;
-        return false;
-    }
     ip += 2;
     d->ip = ip;
-    it->vtok = ip;
     val->doc = d;
     val->tok = ip;
     return true;
@@ -420,7 +508,6 @@ yyjson_api_inline bool yyjson_od_obj_find(yyjson_od_iter *it, const char *key,
             if (yyjson_od_unlikely(!yyjson_od__vtab[buf[idx[ip]]]))
                 goto tape;
             d->ip = ip;
-            it->vtok = ip;
             val->doc = d;
             val->tok = ip;
             return true;
@@ -465,8 +552,49 @@ yyjson_api_inline bool yyjson_od_obj_find_unordered(yyjson_od_iter *it,
                                                     const char *key,
                                                     size_t klen,
                                                     yyjson_od_val *val) {
+    yyjson_od_doc *d = it->doc;
+    uint32_t start = (uint32_t)-1, ip, s;
     if (it->state == 0) return yyjson_od_obj_find(it, key, klen, val);
-    return yyjson_od__find_slow(it, key, klen, val);
+    if (d->err) return false;
+    if (it->state == 1) {
+        /* members whose key token is before `start` are searched after
+           the wrap (the current member included) */
+        start = d->ip;
+        if (yyjson_od_obj_find(it, key, klen, val)) return true;
+        if (d->err) return false;
+    } else if (YYJSON_OD_CH(d, it->otok) == '}') {
+        return false; /* empty object */
+    }
+#if YYJSON_OD_CHECKS
+    if (d->depth != it->depth - 1)
+        return yyjson_od__fail(d, YYJSON_OD_OUT_OF_ORDER);
+#endif
+    /* the object is consumed: wrap around to its first member */
+    {
+        uint32_t end_ip = d->ip, end_depth = d->depth;
+        d->ip = it->otok;
+        d->depth = it->depth;
+        it->state = 0;
+        while (yyjson_od__sep(it, '}')) {
+            ip = d->ip;
+            if (ip >= start) break;
+            s = d->idx[ip] + 1;
+            ip += 2;
+            d->ip = ip;
+            if (s + klen < d->len && d->buf[s + klen] == '"' &&
+                memcmp(d->buf + s, key, klen) == 0 &&
+                yyjson_od__str_end(d, ip - 2) == s + klen) {
+                val->doc = d;
+                val->tok = ip;
+                return true;
+            }
+        }
+        if (d->err) return false;
+        d->ip = end_ip;
+        d->depth = end_depth;
+        it->state = 2;
+        return false;
+    }
 }
 
 /** Next array element. Unread parts of the previous element are skipped.
@@ -482,7 +610,6 @@ yyjson_api_inline bool yyjson_od_arr_next(yyjson_od_iter *it,
         it->state = 2;
         return yyjson_od__fail(d, YYJSON_OD_TAPE);
     }
-    it->vtok = ip;
     val->doc = d;
     val->tok = ip;
     return true;
@@ -528,13 +655,14 @@ yyjson_api_inline bool yyjson_od_get_str(yyjson_od_val *v, yyjson_od_str *out) {
     if (yyjson_od_unlikely(YYJSON_OD_CH(d, v->tok) != '"'))
         return yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE);
     s = d->idx[v->tok] + 1;
-    e = yyjson_od__str_end(d, v->tok);
-    if (yyjson_od_unlikely(!e)) return yyjson_od__fail(d, YYJSON_OD_TAPE);
-    if (yyjson_od_likely(!yyjson_od__has_spc(d->spc, s, e))) {
+    e = yyjson_od__str_scan(d, v->tok, s);
+    if (yyjson_od_likely(e)) {
         out->ptr = (const char *)d->buf + s;
         out->len = (size_t)(e - s);
-    } else if (!yyjson_od__str_slow(d, s, e, out)) {
-        return false;
+    } else {
+        e = yyjson_od__str_end(d, v->tok);
+        if (yyjson_od_unlikely(!e)) return yyjson_od__fail(d, YYJSON_OD_TAPE);
+        if (!yyjson_od__str_slow(d, s, e, out)) return false;
     }
     if (pos == 1) d->ip++;
     return true;

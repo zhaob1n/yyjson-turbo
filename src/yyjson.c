@@ -6933,22 +6933,100 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
     return true;
 }
 
-/* On Demand variant of s1_index: one token per string (opening quote). */
+/* On Demand stage 1, as lean as simdjson's ondemand stage 1 (icelake with
+   AVX-512, haswell with AVX2): one token per string (its opening quote), no
+   closing quotes and no escape masks (escapes are found lazily when a string
+   is read). Unescaped control characters inside strings and invalid UTF-8
+   are document errors, as in simdjson. */
+static_inline u64 s1_block_od(const u8 *p, u64 *next_esc, u64 *prev_in,
+                              u64 *prev_scalar, s1_utf8 *u, usize *nna,
+                              u64 *cerr) {
+    u64 ws, op, qt, bs, ctrl, escaped, quote, in_str, scalar, nq, st;
+#if defined(__AVX512BW__) && !defined(YYJSON_STAGE1_NO512CLS)
+    const __m512i wt = _mm512_broadcast_i32x4(_mm_setr_epi8(
+        ' ', 100, 100, 100, 17, 100, 113, 2, 100, '\t', '\n', 112, 100, '\r',
+        100, 100));
+    const __m512i ot = _mm512_broadcast_i32x4(_mm_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ':', '{', ',', '}', 0, 0));
+    const __m512i z = _mm512_loadu_si512((const void *)p);
+    ws = _mm512_cmpeq_epi8_mask(z, _mm512_shuffle_epi8(wt, z));
+    op = _mm512_cmpeq_epi8_mask(_mm512_or_si512(z, _mm512_set1_epi8(0x20)),
+                                _mm512_shuffle_epi8(ot, z));
+    qt = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('"'));
+    bs = _mm512_cmpeq_epi8_mask(z, _mm512_set1_epi8('\\'));
+    ctrl = _mm512_cmple_epu8_mask(z, _mm512_set1_epi8(0x1F));
+    if (likely(!_mm512_movepi8_mask(z))) {
+        /* ASCII block (simdjson: error |= prev_incomplete); a stale prev
+           block that ended complete is equivalent to an ASCII one */
+        u->err = _mm256_or_si256(u->err, u->inc);
+    } else if (*nna >= S1_ZUTF8_MIN) {
+        s1_utf8_stepz(u, z);
+    } else {
+        (*nna)++;
+        s1_utf8_step(u, _mm512_castsi512_si256(z));
+        s1_utf8_step(u, _mm512_extracti64x4_epi64(z, 1));
+    }
+#else
+    const __m256i wtab = S1_T16(' ', 100, 100, 100, 17, 100, 113, 2, 100,
+                                '\t', '\n', 112, 100, '\r', 100, 100);
+    const __m256i otab = S1_T16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                ':', '{', ',', '}', 0, 0);
+    const __m256i v20 = _mm256_set1_epi8(0x20), v1f = _mm256_set1_epi8(0x1F);
+    const __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
+    __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)p);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + 32));
+    ws = s1_mm2(_mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(wtab, a)),
+                _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(wtab, b)));
+    op = s1_mm2(_mm256_cmpeq_epi8(_mm256_or_si256(a, v20),
+                                  _mm256_shuffle_epi8(otab, a)),
+                _mm256_cmpeq_epi8(_mm256_or_si256(b, v20),
+                                  _mm256_shuffle_epi8(otab, b)));
+    qt = s1_mm2(_mm256_cmpeq_epi8(a, vq), _mm256_cmpeq_epi8(b, vq));
+    bs = s1_mm2(_mm256_cmpeq_epi8(a, vb), _mm256_cmpeq_epi8(b, vb));
+    ctrl = s1_mm2(_mm256_cmpeq_epi8(_mm256_min_epu8(a, v1f), a),
+                  _mm256_cmpeq_epi8(_mm256_min_epu8(b, v1f), b));
+    (void)nna;
+    if (likely(_mm256_movemask_epi8(_mm256_or_si256(a, b)) == 0)) {
+        u->err = _mm256_or_si256(u->err, u->inc);
+    } else {
+        s1_utf8_step(u, a);
+        s1_utf8_step(u, b);
+    }
+#endif
+    if (likely(!bs)) {
+        escaped = *next_esc;
+        *next_esc = 0;
+    } else {
+        u64 pe = bs & ~*next_esc;
+        u64 ec = (((pe << 1) | S1_ODD) - pe) ^ S1_ODD;
+        escaped = ec ^ (bs | *next_esc);
+        *next_esc = (ec & bs) >> 63;
+    }
+    quote = qt & ~escaped;
+    in_str = s1_prefix_xor(quote) ^ *prev_in;
+    *prev_in = (u64)((i64)in_str >> 63);
+    scalar = ~(op | ws);
+    nq = scalar & ~quote;
+    st = (op | (scalar & ~((nq << 1) | *prev_scalar))) & ~(in_str ^ quote);
+    *prev_scalar = nq >> 63;
+    *cerr |= ctrl & in_str;
+    return st;
+}
+
 static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
-                                 u64 *spc, usize *ntok) {
-    s1_st s;
-    u64 prev_st = 0, st, cerr = 0;
+                                 usize *ntok) {
+    u64 prev_st = 0, st, cerr = 0, next_esc = 0, prev_in = 0, prev_scalar = 0;
     u32 prev_base = 0;
     u32 *out = idx;
-    usize pos = 0, blk = 0, full = len & ~(usize)63;
+    usize pos = 0, nna = 0, full = len & ~(usize)63;
     u8 tmp[64];
+    s1_utf8 u;
     bool utf8_ok;
-    s.next_esc = s.prev_in = s.prev_scalar = 0;
-    s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
-    s.nna = 0;
-    s.dirty = 0;
-    for (; pos < full; pos += 64, blk++) {
-        st = s1_block_x(buf + pos, NULL, &s, spc + blk, 1, &cerr);
+    u.prev = u.err = u.inc = _mm256_setzero_si256();
+    for (; pos < full; pos += 64) {
+        st = s1_block_od(buf + pos, &next_esc, &prev_in, &prev_scalar, &u,
+                         &nna, &cerr);
+        /* bit_indexer: write the previous block while this one is scanned */
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
         prev_base = (u32)pos;
@@ -6956,15 +7034,16 @@ static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
     if (pos < len) {
         memset(tmp, ' ', 64);
         memcpy(tmp, buf + pos, len - pos);
-        st = s1_block_x(tmp, NULL, &s, spc + blk, 1, &cerr);
+        st = s1_block_od(tmp, &next_esc, &prev_in, &prev_scalar, &u, &nna,
+                         &cerr);
         out = s1_write(out, prev_base, prev_st);
         prev_st = st;
         prev_base = (u32)pos;
     }
     out = s1_write(out, prev_base, prev_st);
-    if (s.prev_in || cerr) return false;
-    s.u.err = _mm256_or_si256(s.u.err, s.u.inc);
-    utf8_ok = _mm256_testz_si256(s.u.err, s.u.err) != 0;
+    if (prev_in || cerr) return false;
+    u.err = _mm256_or_si256(u.err, u.inc);
+    utf8_ok = _mm256_testz_si256(u.err, u.err) != 0;
 #if S1_Z && (defined(__GNUC__) || defined(__clang__))
     __asm__ __volatile__("vpxord %%xmm16, %%xmm16, %%xmm16\n\t""vpxord %%xmm17, %%xmm17, %%xmm17\n\t""vpxord %%xmm18, %%xmm18, %%xmm18\n\t""vpxord %%xmm19, %%xmm19, %%xmm19\n\t""vpxord %%xmm20, %%xmm20, %%xmm20\n\t""vpxord %%xmm21, %%xmm21, %%xmm21\n\t""vpxord %%xmm22, %%xmm22, %%xmm22\n\t""vpxord %%xmm23, %%xmm23, %%xmm23\n\t"
         ::: "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23");
@@ -7071,9 +7150,9 @@ static bool s1_utf8_scalar(const u8 *p, usize len) {
 }
 
 /* On Demand variant (portable): one token per string (opening quote),
-   spc = backslashes, control characters in strings are an error. */
+   control characters in strings are an error. */
 static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
-                                 u64 *spc, usize *ntok) {
+                                 usize *ntok) {
     u64 prev_esc = 0, prev_in = 0, prev_scalar = 0, hi = 0, cerr = 0;
     u32 *out = idx;
     usize pos;
@@ -7106,7 +7185,6 @@ static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
         prev_scalar = nq >> 63;
         cerr |= m.ctrl & in_str;
         hi |= m.hi;
-        spc[pos >> 6] = m.bs;
         out = s1_flatten(out, (u32)pos, st);
     }
     if (prev_in || cerr) return false;
@@ -7784,10 +7862,9 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
  * Internal hooks for the On Demand prototype (src/yyjson_ondemand.c).
  * Not part of the public API.
  *============================================================================*/
-yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx,
                                  usize *ntok);
-yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
-                                  const u64 *spc, u8 *out);
+yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out);
 yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
                                     yyjson_val *val);
 yyjson_api bool yyjson_od__f64(u64 sig, i32 exp, bool sign, yyjson_val *val);
@@ -7799,18 +7876,11 @@ static_inline u8 *od_unconst(const u8 *p) {
     return u.m;
 }
 
-yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx,
                                  usize *ntok) {
-    return s1_index_od(buf, len, idx, spc, ntok);
+    return s1_index_od(buf, len, idx, ntok);
 }
 
-#if S1_AVX2
-yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
-                                  const u64 *spc, u8 *out) {
-    yyjson_val tmp;
-    return s1_str_esc(od_unconst(hdr), od_unconst(beg), od_unconst(end), spc, &tmp, out);
-}
-#else
 static_inline bool od_hex4(const u8 *p, u32 *cp) {
     u32 v = 0, i;
     for (i = 0; i < 4; i++) {
@@ -7825,12 +7895,10 @@ static_inline bool od_hex4(const u8 *p, u32 *cp) {
 }
 /* Portable unescape of [beg, end) into out (out may equal beg). UTF-8 was
    validated by stage 1. Returns the written NUL terminator or NULL. */
-yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
-                                  const u64 *spc, u8 *out) {
+yyjson_api u8 *yyjson_od__str_esc(const u8 *beg, const u8 *end, u8 *out) {
     const u8 *src = beg;
     u8 *dst = out;
     u32 cp, lo;
-    (void)hdr; (void)spc;
     while (src < end) {
         u8 c = *src;
         if (c >= 0x20 && c != '\\') { *dst++ = c; src++; continue; }
@@ -7878,7 +7946,6 @@ yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
     *dst = '\0';
     return dst;
 }
-#endif
 
 yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
                                     yyjson_val *val) {

@@ -47,15 +47,15 @@ struct Ctx {
 };
 
 // ---- small helpers for yyjson_od ----
-static inline yyjson_od_val odf(yyjson_od_iter &it, const char *k) {
+static inline __attribute__((always_inline)) yyjson_od_val odf(yyjson_od_iter &it, const char *k) {
   yyjson_od_val v; CHECK(yyjson_od_obj_find(&it, k, strlen(k), &v)); return v;
 }
-static inline sv ods(yyjson_od_val v) { yyjson_od_str s; CHECK(yyjson_od_get_str(&v, &s)); return sv(s.ptr, s.len); }
-static inline u64 odu(yyjson_od_val v) { u64 x; CHECK(yyjson_od_get_uint(&v, &x)); return x; }
-static inline int64_t odi(yyjson_od_val v) { int64_t x; CHECK(yyjson_od_get_sint(&v, &x)); return x; }
-static inline double odd(yyjson_od_val v) { double x; CHECK(yyjson_od_get_real(&v, &x)); return x; }
-static inline yyjson_od_iter odo(yyjson_od_val v) { yyjson_od_iter it; CHECK(yyjson_od_get_obj(&v, &it)); return it; }
-static inline yyjson_od_iter oda(yyjson_od_val v) { yyjson_od_iter it; CHECK(yyjson_od_get_arr(&v, &it)); return it; }
+static inline __attribute__((always_inline)) sv ods(yyjson_od_val v) { yyjson_od_str s; CHECK(yyjson_od_get_str(&v, &s)); return sv(s.ptr, s.len); }
+static inline __attribute__((always_inline)) u64 odu(yyjson_od_val v) { u64 x; CHECK(yyjson_od_get_uint(&v, &x)); return x; }
+static inline __attribute__((always_inline)) int64_t odi(yyjson_od_val v) { int64_t x; CHECK(yyjson_od_get_sint(&v, &x)); return x; }
+static inline __attribute__((always_inline)) double odd(yyjson_od_val v) { double x; CHECK(yyjson_od_get_real(&v, &x)); return x; }
+static inline __attribute__((always_inline)) yyjson_od_iter odo(yyjson_od_val v) { yyjson_od_iter it; CHECK(yyjson_od_get_obj(&v, &it)); return it; }
+static inline __attribute__((always_inline)) yyjson_od_iter oda(yyjson_od_val v) { yyjson_od_iter it; CHECK(yyjson_od_get_arr(&v, &it)); return it; }
 static inline void odend(yyjson_od_doc *d) { CHECK(yyjson_od_doc_err(d) == 0); }
 // ---- yyjson DOM helpers ----
 static inline yyjson_val *yg(yyjson_val *o, const char *k) { yyjson_val *v = yyjson_obj_get(o, k); CHECK(v); return v; }

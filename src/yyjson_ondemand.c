@@ -9,10 +9,9 @@
 struct yyjson_od_parser {
     yyjson_alc alc;
     uint32_t *idx;
-    uint64_t *spc;
     unsigned char *scr;
     unsigned char *tmp;     /* padded copy for scalar roots */
-    size_t cap;             /* input capacity of idx/spc/scr */
+    size_t cap;             /* input capacity of idx/scr */
     size_t tmp_cap;
     yyjson_od_doc doc;
 };
@@ -108,10 +107,8 @@ yyjson_od_parser *yyjson_od_parser_new(const yyjson_alc *alc) {
 
 static void od_release(yyjson_od_parser *p) {
     if (p->idx) p->alc.free(p->alc.ctx, p->idx);
-    if (p->spc) p->alc.free(p->alc.ctx, p->spc);
     if (p->scr) p->alc.free(p->alc.ctx, p->scr);
     p->idx = NULL;
-    p->spc = NULL;
     p->scr = NULL;
     p->cap = 0;
 }
@@ -131,10 +128,8 @@ static bool od_reserve(yyjson_od_parser *p, size_t len) {
     if (cap < 4096) cap = 4096;
     p->idx = (uint32_t *)p->alc.malloc(p->alc.ctx,
                                        (cap + 128) * sizeof(uint32_t));
-    p->spc = (uint64_t *)p->alc.malloc(p->alc.ctx,
-                                       (cap / 64 + 2) * sizeof(uint64_t));
     p->scr = (unsigned char *)p->alc.malloc(p->alc.ctx, cap + 64);
-    if (!p->idx || !p->spc || !p->scr) {
+    if (!p->idx || !p->scr) {
         od_release(p);
         return false;
     }
@@ -154,7 +149,7 @@ yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p, const char *buf,
     if (len == 0) OD_RET(YYJSON_OD_EMPTY);
     if (len >= (size_t)0xFFFFFF00u) OD_RET(YYJSON_OD_TOO_LARGE);
     if (!od_reserve(p, len)) OD_RET(YYJSON_OD_MEMORY);
-    if (!yyjson_od__index((const unsigned char *)buf, len, p->idx, p->spc,
+    if (!yyjson_od__index((const unsigned char *)buf, len, p->idx,
                           &ntok)) {
         OD_RET(YYJSON_OD_INVALID);
     }
@@ -162,7 +157,6 @@ yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p, const char *buf,
     d = &p->doc;
     d->buf = (const unsigned char *)buf;
     d->idx = p->idx;
-    d->spc = p->spc;
     d->scr = p->scr;
     d->scr_beg = p->scr;
     d->scr_end = p->scr + p->cap + 64;
@@ -264,7 +258,7 @@ bool yyjson_od__str_slow(yyjson_od_doc *d, uint32_t s, uint32_t e,
     unsigned char *dst = d->scr, *end;
     if ((size_t)(d->scr_end - dst) < (size_t)(e - s) + 8)
         return yyjson_od__fail(d, YYJSON_OD_MEMORY); /* only on re-reads */
-    end = yyjson_od__str_esc(d->buf, d->buf + s, d->buf + e, d->spc, dst);
+    end = yyjson_od__str_esc(d->buf + s, d->buf + e, dst);
     if (!end) return yyjson_od__fail(d, YYJSON_OD_STRING);
     out->ptr = (const char *)dst;
     out->len = (size_t)(end - dst);
@@ -282,43 +276,6 @@ bool yyjson_od__num_slow(yyjson_od_doc *d, uint32_t tok, yyjson_val *out) {
     if (e != d->buf + d->idx[tok + 1] && !YYJSON_OD_WS(*e))
         return yyjson_od__fail(d, YYJSON_OD_NUMBER);
     return true;
-}
-
-bool yyjson_od__find_slow(yyjson_od_iter *it, const char *key, size_t klen,
-                          yyjson_od_val *val) {
-    yyjson_od_doc *d = it->doc;
-    uint32_t start, end_ip, ip, s;
-    if (d->err || it->vtok == 0) return false;
-    start = it->vtok - 2; /* key token of the current member */
-    if (it->state == 1) {
-        if (yyjson_od_obj_find(it, key, klen, val)) return true;
-        if (d->err) return false;
-    }
-    /* the object is consumed: wrap around to its first member */
-    end_ip = d->ip;
-    d->ip = it->otok;
-    d->depth = it->depth;
-    it->state = 0;
-    while (yyjson_od__sep(it, '}')) {
-        ip = d->ip;
-        if (ip > start) break;
-        s = d->idx[ip] + 1;
-        ip += 2;
-        d->ip = ip;
-        it->vtok = ip;
-        if (s + klen < d->len && d->buf[s + klen] == '"' &&
-            memcmp(d->buf + s, key, klen) == 0 &&
-            yyjson_od__str_end(d, ip - 2) == s + klen) {
-            val->doc = d;
-            val->tok = ip;
-            return true;
-        }
-    }
-    if (d->err) return false;
-    d->ip = end_ip;
-    d->depth = it->depth - 1;
-    it->state = 2;
-    return false;
 }
 
 size_t yyjson_od_count(yyjson_od_val *v) {
@@ -398,7 +355,11 @@ const char *yyjson_od_err_msg(int code) {
 
 bool yyjson_od_doc_finish(yyjson_od_doc *d) {
     if (d->err) return false;
-    if (!yyjson_od__finish(d, 0, 0)) return false;
+    if (d->depth > 0) {
+        if (!yyjson_od__skip_to(d, 0)) return false;
+    } else if (d->ip == 0 && d->ntok > 0) {
+        if (!yyjson_od__skip_val(d, 0)) return false;
+    }
     if (d->depth != 0 || d->ip != d->ntok)
         return yyjson_od__fail(d, YYJSON_OD_TAPE);
     return true;
