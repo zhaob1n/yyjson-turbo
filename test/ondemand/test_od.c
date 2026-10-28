@@ -226,6 +226,7 @@ static void unit(void) {
     CHECK(yyjson_od_get_obj(&r, &it));
     {
         yyjson_od_key k;
+        memset(&k, 0, sizeof(k));
         CHECK(yyjson_od_obj_next(&it, &k, &v));
         CHECK(yyjson_od_key_eq(&k, "ab", 2) && !yyjson_od_key_eq(&k, "a", 1));
         CHECK(!yyjson_od_key_eq(&k, "abc", 3) && yyjson_od_key_len(d, &k) == 2);
