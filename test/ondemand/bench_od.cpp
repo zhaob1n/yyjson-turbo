@@ -395,11 +395,12 @@ static void odwalk(yyjson_od_val v, WalkR &r) {
     default: CHECK(0);
   }
 }
-template <class V> static void sjwalk(V v, WalkR &r) {
+// idiomatic simdjson On Demand traversal (cf. simdjson's recursive_print_json)
+static void sjwalk(ondemand::value v, WalkR &r) {
   switch (v.type()) {
-    case ondemand::json_type::object: r.obj++; for (auto f : v.get_object()) { r.keys++; sjwalk(f.value().value(), r); } break;
-    case ondemand::json_type::array: r.arr++; for (auto x : v.get_array()) sjwalk(x.value(), r); break;
-    case ondemand::json_type::string: r.str++; r.sbytes += sv(v.get_string()).size(); break;
+    case ondemand::json_type::object: r.obj++; for (ondemand::field f : v.get_object()) { r.keys++; sjwalk(f.value(), r); } break;
+    case ondemand::json_type::array: r.arr++; for (ondemand::value x : v.get_array()) sjwalk(x, r); break;
+    case ondemand::json_type::string: r.str++; r.sbytes += std::string_view(v.get_string()).size(); break;
     case ondemand::json_type::number: r.num++; r.sum += double(v.get_double()); break;
     case ondemand::json_type::boolean: (bool(v.get_bool()) ? r.t : r.f)++; break;
     case ondemand::json_type::null: CHECK(v.is_null()); r.nul++; break;
@@ -431,7 +432,7 @@ static void sdwalk(dom::element v, WalkR &r) {
 struct Walk {
   typedef WalkR R;
   static void od(Ctx &c, R &r) { yyjson_od_doc *d = c.od(); odwalk(yyjson_od_doc_root(d), r); CHECK(yyjson_od_doc_finish(d)); }
-  static void sj(Ctx &c, R &r) { auto doc = c.sj(); sjwalk(doc.get_value().value(), r); CHECK(doc.at_end()); }
+  static void sj(Ctx &c, R &r) { auto doc = c.sj(); ondemand::value root = doc.get_value(); sjwalk(root, r); CHECK(doc.at_end()); }
   static void yy(Ctx &c, R &r) { yyjson_doc *d = c.yy(); yywalk(yyjson_doc_get_root(d), r); yyjson_doc_free(d); }
   static void sd(Ctx &c, R &r) { sdwalk(c.sd(), r); }
 };
@@ -488,7 +489,7 @@ int main(int argc, char **argv) {
         gs = load(dir + "/gsoc-2018.json"), nu = load(dir + "/numbers.json"), uc = load(dir + "/update-center.json");
   printf("| task | file | yyjson_od GB/s | simdjson_od GB/s | od ratio (yy/sj) | yyjson_dom GB/s | simdjson_dom GB/s | yy_dom/yy_od | sj_dom/yy_od | od ratio (median) |\n");
   printf("|---|---|---|---|---|---|---|---|---|---|\n");
-#define RUN(T, name, in) if (strstr(name, flt)) run<T>(c, name, in, rounds, raw)
+#define RUN(T, nm, in) if (strstr((std::string(nm) + ":" + (in).name).c_str(), flt)) run<T>(c, nm, in, rounds, raw)
   RUN(PartialTweets, "partial_tweets", tw);
   RUN(TopTweet, "top_tweet", tw);
   RUN(DistinctUserId, "distinct_user_id", tw);

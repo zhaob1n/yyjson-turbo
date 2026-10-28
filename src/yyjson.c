@@ -6781,7 +6781,8 @@ typedef struct s1_st {
 } s1_st;
 
 /* One 64-byte block: returns structural bits, stores the special mask. */
-static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
+static_inline u64 s1_block_x(const u8 *p, u8 *d, s1_st *s, u64 *spc,
+                             const int od, u64 *cerr) {
     const __m256i wtab = S1_T16(' ', 100, 100, 100, 17, 100, 113, 2, 100,
                                 '\t', '\n', 112, 100, '\r', 100, 100);
     const __m256i otab = S1_T16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -6873,10 +6874,18 @@ static_inline u64 s1_block(const u8 *p, u8 *d, s1_st *s, u64 *spc) {
     nq = scalar & ~quote;
     st = (op | (scalar & ~((nq << 1) | s->prev_scalar))) & ~(in_str ^ quote);
     s->prev_scalar = nq >> 63;
+    if (od) {
+        /* On Demand: no closing quotes; unescaped control characters inside
+           strings are a document error (as in simdjson); spc = backslash */
+        *cerr |= ctrl & in_str;
+        *spc = bs;
+        return st;
+    }
     st |= quote & ~in_str; /* yyjson: closing quotes too */
     *spc = bs | ctrl;
     return st;
 }
+#define s1_block(p, d, s, spc) s1_block_x(p, d, s, spc, 0, NULL)
 
 static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
                               u64 *spc, usize *ntok, bool *utf8_ok) {
@@ -6919,6 +6928,50 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
         ::: "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29", "xmm30", "xmm31");
 #endif
     if (!*utf8_ok) return false;
+    *ntok = (usize)(out - idx);
+    out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
+    return true;
+}
+
+/* On Demand variant of s1_index: one token per string (opening quote). */
+static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
+                                 u64 *spc, usize *ntok) {
+    s1_st s;
+    u64 prev_st = 0, st, cerr = 0;
+    u32 prev_base = 0;
+    u32 *out = idx;
+    usize pos = 0, blk = 0, full = len & ~(usize)63;
+    u8 tmp[64];
+    bool utf8_ok;
+    s.next_esc = s.prev_in = s.prev_scalar = 0;
+    s.u.prev = s.u.err = s.u.inc = _mm256_setzero_si256();
+    s.nna = 0;
+    s.dirty = 0;
+    for (; pos < full; pos += 64, blk++) {
+        st = s1_block_x(buf + pos, NULL, &s, spc + blk, 1, &cerr);
+        out = s1_write(out, prev_base, prev_st);
+        prev_st = st;
+        prev_base = (u32)pos;
+    }
+    if (pos < len) {
+        memset(tmp, ' ', 64);
+        memcpy(tmp, buf + pos, len - pos);
+        st = s1_block_x(tmp, NULL, &s, spc + blk, 1, &cerr);
+        out = s1_write(out, prev_base, prev_st);
+        prev_st = st;
+        prev_base = (u32)pos;
+    }
+    out = s1_write(out, prev_base, prev_st);
+    if (s.prev_in || cerr) return false;
+    s.u.err = _mm256_or_si256(s.u.err, s.u.inc);
+    utf8_ok = _mm256_testz_si256(s.u.err, s.u.err) != 0;
+#if S1_Z && (defined(__GNUC__) || defined(__clang__))
+    __asm__ __volatile__("vpxord %%xmm16, %%xmm16, %%xmm16\n\t""vpxord %%xmm17, %%xmm17, %%xmm17\n\t""vpxord %%xmm18, %%xmm18, %%xmm18\n\t""vpxord %%xmm19, %%xmm19, %%xmm19\n\t""vpxord %%xmm20, %%xmm20, %%xmm20\n\t""vpxord %%xmm21, %%xmm21, %%xmm21\n\t""vpxord %%xmm22, %%xmm22, %%xmm22\n\t""vpxord %%xmm23, %%xmm23, %%xmm23\n\t"
+        ::: "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23");
+    __asm__ __volatile__("vpxord %%xmm24, %%xmm24, %%xmm24\n\t""vpxord %%xmm25, %%xmm25, %%xmm25\n\t""vpxord %%xmm26, %%xmm26, %%xmm26\n\t""vpxord %%xmm27, %%xmm27, %%xmm27\n\t""vpxord %%xmm28, %%xmm28, %%xmm28\n\t""vpxord %%xmm29, %%xmm29, %%xmm29\n\t""vpxord %%xmm30, %%xmm30, %%xmm30\n\t""vpxord %%xmm31, %%xmm31, %%xmm31\n\t"
+        ::: "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29", "xmm30", "xmm31");
+#endif
+    if (!utf8_ok) return false;
     *ntok = (usize)(out - idx);
     out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
     return true;
@@ -6983,6 +7036,81 @@ static_noinline bool s1_index(const u8 *buf, u8 *dst, usize len, u32 *idx,
 #else
     *utf8_ok = true;
 #endif
+    *ntok = (usize)(out - idx);
+    out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
+    return true;
+}
+
+/* Strict scalar UTF-8 check (no overlongs, surrogates or > U+10FFFF). */
+static bool s1_utf8_scalar(const u8 *p, usize len) {
+    const u8 *e = p + len;
+    while (p < e) {
+        u8 c = *p;
+        if (c < 0x80) { p++; continue; }
+        if (c >= 0xC2 && c <= 0xDF) {
+            if (e - p < 2 || (p[1] & 0xC0) != 0x80) return false;
+            p += 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            if (e - p < 3 || (p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80)
+                return false;
+            if (c == 0xE0 && p[1] < 0xA0) return false;
+            if (c == 0xED && p[1] > 0x9F) return false;
+            p += 3;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            if (e - p < 4 || (p[1] & 0xC0) != 0x80 ||
+                (p[2] & 0xC0) != 0x80 || (p[3] & 0xC0) != 0x80)
+                return false;
+            if (c == 0xF0 && p[1] < 0x90) return false;
+            if (c == 0xF4 && p[1] > 0x8F) return false;
+            p += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* On Demand variant (portable): one token per string (opening quote),
+   spc = backslashes, control characters in strings are an error. */
+static_noinline bool s1_index_od(const u8 *buf, usize len, u32 *idx,
+                                 u64 *spc, usize *ntok) {
+    u64 prev_esc = 0, prev_in = 0, prev_scalar = 0, hi = 0, cerr = 0;
+    u32 *out = idx;
+    usize pos;
+    u8 tmp[64];
+    for (pos = 0; pos < len; pos += 64) {
+        const u8 *p = buf + pos;
+        s1_masks m;
+        u64 escaped, quote, in_str, scalar, nq, st;
+        if (unlikely(len - pos < 64)) {
+            memset(tmp, ' ', 64);
+            memcpy(tmp, p, len - pos);
+            p = tmp;
+        }
+        s1_classify(p, &m);
+        if (!m.bs) {
+            escaped = prev_esc;
+            prev_esc = 0;
+        } else {
+            u64 pe = m.bs & ~prev_esc;
+            u64 ec = (((pe << 1) | S1_ODD) - pe) ^ S1_ODD;
+            escaped = ec ^ (m.bs | prev_esc);
+            prev_esc = (ec & m.bs) >> 63;
+        }
+        quote = m.qt & ~escaped;
+        in_str = s1_prefix_xor(quote) ^ prev_in;
+        prev_in = (u64)((i64)in_str >> 63);
+        scalar = ~(m.op | m.ws);
+        nq = scalar & ~quote;
+        st = (m.op | (scalar & ~((nq << 1) | prev_scalar))) & ~(in_str ^ quote);
+        prev_scalar = nq >> 63;
+        cerr |= m.ctrl & in_str;
+        hi |= m.hi;
+        spc[pos >> 6] = m.bs;
+        out = s1_flatten(out, (u32)pos, st);
+    }
+    if (prev_in || cerr) return false;
+    if (hi && !s1_utf8_scalar(buf, len)) return false;
     *ntok = (usize)(out - idx);
     out[0] = out[1] = out[2] = out[3] = (u32)len; /* sentinels */
     return true;
@@ -7652,40 +7780,125 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
     return ret;
 }
 
-#if S1_AVX2
 /*==============================================================================
  * Internal hooks for the On Demand prototype (src/yyjson_ondemand.c).
  * Not part of the public API.
  *============================================================================*/
 yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx, u64 *spc,
-                                 usize *ntok) {
-    bool utf8_ok = false;
-    if (!s1_index(buf, (u8 *)buf, len, idx, spc, ntok, &utf8_ok)) return false;
-    return utf8_ok;
+                                 usize *ntok);
+yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
+                                  const u64 *spc, u8 *out);
+yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
+                                    yyjson_val *val);
+yyjson_api bool yyjson_od__f64(u64 sig, i32 exp, bool sign, yyjson_val *val);
+
+/* Drop const without -Wcast-qual noise: the readers never write here. */
+static_inline u8 *od_unconst(const u8 *p) {
+    union { const u8 *c; u8 *m; } u;
+    u.c = p;
+    return u.m;
 }
 
+yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx, u64 *spc,
+                                 usize *ntok) {
+    return s1_index_od(buf, len, idx, spc, ntok);
+}
+
+#if S1_AVX2
 yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
                                   const u64 *spc, u8 *out) {
     yyjson_val tmp;
-    return s1_str_esc((u8 *)hdr, (u8 *)beg, (u8 *)end, spc, &tmp, out);
+    return s1_str_esc(od_unconst(hdr), od_unconst(beg), od_unconst(end), spc, &tmp, out);
 }
+#else
+static_inline bool od_hex4(const u8 *p, u32 *cp) {
+    u32 v = 0, i;
+    for (i = 0; i < 4; i++) {
+        u8 c = p[i];
+        if (c >= '0' && c <= '9') v = (v << 4) | (u32)(c - '0');
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f')
+            v = (v << 4) | (u32)((c | 0x20) - 'a' + 10);
+        else return false;
+    }
+    *cp = v;
+    return true;
+}
+/* Portable unescape of [beg, end) into out (out may equal beg). UTF-8 was
+   validated by stage 1. Returns the written NUL terminator or NULL. */
+yyjson_api u8 *yyjson_od__str_esc(const u8 *hdr, const u8 *beg, const u8 *end,
+                                  const u64 *spc, u8 *out) {
+    const u8 *src = beg;
+    u8 *dst = out;
+    u32 cp, lo;
+    (void)hdr; (void)spc;
+    while (src < end) {
+        u8 c = *src;
+        if (c >= 0x20 && c != '\\') { *dst++ = c; src++; continue; }
+        if (c < 0x20 || end - src < 2) return NULL;
+        switch (src[1]) {
+            case '"':  *dst++ = '"';  src += 2; break;
+            case '\\': *dst++ = '\\'; src += 2; break;
+            case '/':  *dst++ = '/';  src += 2; break;
+            case 'b':  *dst++ = '\b'; src += 2; break;
+            case 'f':  *dst++ = '\f'; src += 2; break;
+            case 'n':  *dst++ = '\n'; src += 2; break;
+            case 'r':  *dst++ = '\r'; src += 2; break;
+            case 't':  *dst++ = '\t'; src += 2; break;
+            case 'u':
+                if (end - src < 6 || !od_hex4(src + 2, &cp)) return NULL;
+                src += 6;
+                if ((cp & 0xFC00) == 0xD800) {
+                    if (end - src < 6 || src[0] != '\\' || src[1] != 'u' ||
+                        !od_hex4(src + 2, &lo) || (lo & 0xFC00) != 0xDC00)
+                        return NULL;
+                    src += 6;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                } else if ((cp & 0xFC00) == 0xDC00) {
+                    return NULL;
+                }
+                if (cp < 0x80) {
+                    *dst++ = (u8)cp;
+                } else if (cp < 0x800) {
+                    *dst++ = (u8)(0xC0 | (cp >> 6));
+                    *dst++ = (u8)(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    *dst++ = (u8)(0xE0 | (cp >> 12));
+                    *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (u8)(0x80 | (cp & 0x3F));
+                } else {
+                    *dst++ = (u8)(0xF0 | (cp >> 18));
+                    *dst++ = (u8)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (u8)(0x80 | (cp & 0x3F));
+                }
+                break;
+            default: return NULL;
+        }
+    }
+    *dst = '\0';
+    return dst;
+}
+#endif
 
 yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
                                     yyjson_val *val) {
-    u8 *p = (u8 *)cur;
+    u8 *p = od_unconst(cur);
     u8 raw_end[1];
     u8 *raw_ptr = raw_end;
     u8 **pre = &raw_ptr;
     const char *msg;
 #if !YYJSON_DISABLE_FAST_FP_CONV
-    if (s1_num(&p, (u8 *)eof, val)) return p;
+    if (s1_num(&p, od_unconst(eof), val)) return p;
 #else
     (void)eof;
 #endif
     if (!read_num(&p, pre, 0, val, &msg)) return NULL;
     return p;
 }
-#endif /* S1_AVX2 */
+
+yyjson_api bool yyjson_od__f64(u64 sig, i32 exp, bool sign, yyjson_val *val) {
+    return s1_f64_conv(sig, exp, sign, val);
+}
 #endif /* YYJSON_DISABLE_STAGE1 */
 
 yyjson_doc *yyjson_read_opts(char *dat, usize len,

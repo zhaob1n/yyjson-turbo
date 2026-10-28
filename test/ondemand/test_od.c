@@ -147,6 +147,25 @@ static int diff(const char *src, size_t len, int verbose) {
     if (d) {
         root = yyjson_od_doc_root(d);
         oka = od_dump(&a, &root, 0) && yyjson_od_doc_finish(d);
+        if (oka) { /* the integer fast path agrees with the full parser */
+            uint32_t t;
+            for (t = 0; t < d->ntok; t++) {
+                const unsigned char *p = d->buf + d->idx[t], *e1, *e2;
+                uint64_t u;
+                int neg;
+                yyjson_val n;
+                if (*p != '-' && (unsigned char)(*p - '0') > 9) continue;
+                e1 = yyjson_od__pint(p, &u, &neg);
+                if (!e1) continue;
+                e2 = yyjson_od__num(p, d->buf + d->len, &n);
+                if (e1 != e2 || n.uni.u64 != u ||
+                    n.tag != (YYJSON_TYPE_NUM | (neg ? YYJSON_SUBTYPE_SINT
+                                                     : YYJSON_SUBTYPE_UINT))) {
+                    fprintf(stderr, "pint mismatch at %u\n", (unsigned)t);
+                    g_fail++;
+                }
+            }
+        }
     }
     dd = yyjson_read(cp, len, 0);
     okb = dd != NULL;
@@ -253,6 +272,50 @@ static void unit(void) {
         CHECK(yyjson_od_obj_find(&it, "a", 1, &v) && yyjson_od_get_sint(&v, &i64));
         CHECK(yyjson_od_doc_finish(d));
     }
+    /* unordered lookup wraps around; count; raw_json; rewind */
+    d = P_parse("{\"a\":1,\"b\":[1,[2,3],{}],\"c\":\"x\"}", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_obj(&r, &it));
+    CHECK(yyjson_od_obj_find_unordered(&it, "c", 1, &v) && yyjson_od_get_str(&v, &s) && s.len == 1);
+    CHECK(yyjson_od_obj_find_unordered(&it, "a", 1, &v) && yyjson_od_get_uint(&v, &u64) && u64 == 1);
+    CHECK(yyjson_od_obj_find_unordered(&it, "b", 1, &v));
+    CHECK(yyjson_od_count(&v) == 3);
+    CHECK(yyjson_od_raw_json(&v, &s) && s.len == 12 && !memcmp(s.ptr, "[1,[2,3],{}]", 12));
+    CHECK(!yyjson_od_obj_find_unordered(&it, "zz", 2, &v));
+    CHECK(yyjson_od_doc_err(d) == 0);
+    yyjson_od_doc_rewind(d);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_obj(&r, &it));
+    CHECK(yyjson_od_obj_find(&it, "b", 1, &v) && yyjson_od_raw_json(&v, &s) && s.len == 12 && !memcmp(s.ptr, "[1,[2,3],{}]", 12));
+    CHECK(yyjson_od_obj_find(&it, "c", 1, &v));
+    CHECK(yyjson_od_doc_finish(d));
+
+    /* integer fast path edges: long, max, min, negative zero, fraction */
+    d = P_parse("[12345678,123456789012,18446744073709551615,-9223372036854775808,9223372036854775808,-0,1.0,7]", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_arr(&r, &it));
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_uint(&v, &u64) && u64 == 12345678);
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_sint(&v, &i64) && i64 == (int64_t)123456 * 1000000 + 789012);
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_uint(&v, &u64) && u64 == ~(uint64_t)0);
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_sint(&v, &i64) && (uint64_t)i64 == (uint64_t)1 << 63);
+    CHECK(yyjson_od_arr_next(&it, &v) && !yyjson_od_get_sint(&v, &i64)); /* > INT64_MAX */
+    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_INCORRECT_TYPE);
+    /* errors poison the cursor: everything fails afterwards */
+    CHECK(!yyjson_od_arr_next(&it, &v));
+    CHECK(!yyjson_od_get_real(&v, &f));
+    CHECK(!yyjson_od_doc_finish(d));
+    CHECK(yyjson_od_doc_err(d) == YYJSON_OD_INCORRECT_TYPE);
+    CHECK(strlen(yyjson_od_err_msg(YYJSON_OD_INCORRECT_TYPE)) > 0);
+    d = P_parse("[-0,1.0,7]", buf);
+    r = yyjson_od_doc_root(d);
+    CHECK(yyjson_od_get_arr(&r, &it));
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_sint(&v, &i64) && i64 == 0);
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_real(&v, &f) && f == 1.0);
+    CHECK(yyjson_od_arr_next(&it, &v) && yyjson_od_get_uint(&v, &u64) && u64 == 7);
+    CHECK(!yyjson_od_arr_next(&it, &v) && yyjson_od_doc_finish(d));
+
+    /* control characters inside strings are rejected at parse time */
+    CHECK(P_parse("[\"a\tb\"]", buf) == NULL);
 }
 
 static uint64_t rs = ((uint64_t)0x139408dcu << 32) | 0xbbf7a44u;
