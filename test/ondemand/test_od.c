@@ -219,6 +219,8 @@ static void unit(void) {
     double f;
     memset(&it2, 0, sizeof(it2));
     memset(&it3, 0, sizeof(it3));
+    memset(&v, 0, sizeof(v));
+    memset(&x, 0, sizeof(x));
     for (i = 0; i < sizeof(good) / sizeof(*good); i++)
         if (diff(good[i], strlen(good[i]), 1) != 0) { fprintf(stderr, "good[%u]\n", (unsigned)i); g_fail++; }
     for (i = 0; i < sizeof(bad) / sizeof(*bad); i++)

@@ -266,6 +266,33 @@ bool yyjson_od__key_check(yyjson_od_doc *d, uint32_t s, uint32_t bs,
     return true;
 }
 
+uint64_t yyjson_od__resume(const unsigned char *buf, const uint32_t *idx,
+                           uint32_t n, const yyjson_od__ph *ph,
+                           uint32_t end_of, uint32_t end_ip, uint32_t tok) {
+    uint32_t k = 0, c = tok, s;
+    uint64_t r;
+    /* hints point strictly forward, so the walk ends */
+    while (k < YYJSON_OD_PH_SIZE && c != end_of &&
+           ph[c % YYJSON_OD_PH_SIZE].of == c &&
+           ph[c % YYJSON_OD_PH_SIZE].ip > c) {
+        k++;
+        c = ph[c % YYJSON_OD_PH_SIZE].ip;
+    }
+    if (c == end_of) {
+        s = end_ip;
+    } else {
+        r = yyjson_od__skip(buf, idx, n, c + 1, 1, 0);
+        if ((uint32_t)(r >> 32) != 0) return r;
+        s = (uint32_t)r;
+    }
+    while (k--) {
+        r = yyjson_od__skip(buf, idx, n, s, 1, 0);
+        if ((uint32_t)(r >> 32) != 0) return r;
+        s = (uint32_t)r;
+    }
+    return s;
+}
+
 /* token containing byte offset `off` (for error positions) */
 static uint32_t od_tok_at(const yyjson_od_doc *d, uint32_t off) {
     uint32_t lo = 0, hi = d->ntok;

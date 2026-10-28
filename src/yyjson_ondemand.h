@@ -91,6 +91,9 @@ typedef enum yyjson_od_type {
 #define YYJSON_OD_CK_DEPTH 64
 #define YYJSON_OD_PH_SIZE 64
 
+/* resume hint (internal) */
+typedef struct yyjson_od__ph { uint32_t of, ip; } yyjson_od__ph;
+
 /** A document: the indexed input. Fields are internal. */
 typedef struct yyjson_od_doc {
     const unsigned char *buf;   /* input */
@@ -104,10 +107,11 @@ typedef struct yyjson_od_doc {
     uint32_t ntok;              /* number of tokens */
     uint32_t end_of;            /* last container that was completed ... */
     uint32_t end_ip;            /* ... and the token after it */
-    /* resume hints for abandoned iterators: the last value each yielded,
+    /* resume hints for abandoned iterators: the last child container
+       each entered,
        in a small table indexed by container token (a collision only loses
        a hint) */
-    struct { uint32_t of, ip; } ph[YYJSON_OD_PH_SIZE];
+    yyjson_od__ph ph[YYJSON_OD_PH_SIZE];
     uint32_t err_tok;           /* token at which the first error happened */
     int err;                    /* yyjson_od_code */
     /* YYJSON_OD_CHECKS only (always present: the layout is fixed) */
@@ -123,7 +127,10 @@ typedef struct yyjson_od_parser yyjson_od_parser;
 typedef struct yyjson_od_val {
     yyjson_od_doc *doc;
     uint32_t tok;
-    uint32_t depth;             /* depth of its parent iterator (checks) */
+    uint32_t par;               /* container it is a member of (root: ~0) */
+#if YYJSON_OD_CHECKS
+    uint32_t depth;             /* depth of its parent iterator */
+#endif
 } yyjson_od_val;
 
 /** Object or array iterator: it owns its position (16 bytes, kept in
@@ -194,7 +201,10 @@ yyjson_api_inline yyjson_od_val yyjson_od_doc_root(yyjson_od_doc *d) {
     yyjson_od_val v;
     v.doc = d;
     v.tok = 0;
+    v.par = ~(uint32_t)0;
+#if YYJSON_OD_CHECKS
     v.depth = 0;
+#endif
     return v;
 }
 
@@ -369,31 +379,30 @@ yyjson_api_inline uint32_t yyjson_od__str_scan(const yyjson_od_doc *d,
 
 #define YYJSON_OD_DONE (~(uint32_t)0)
 
-/* Progress hint for the parent: the value an iterator just yielded. Only
-   stored here (never loaded on the iterator's own path), so the iterator
-   position stays in registers. */
-#define YYJSON_OD__HINT(d, it, ip) \
-    do { \
-        uint32_t ph_ = (it)->otok - 1; \
-        (d)->ph[ph_ % YYJSON_OD_PH_SIZE].of = ph_; \
-        (d)->ph[ph_ % YYJSON_OD_PH_SIZE].ip = (ip); \
-    } while (0)
+
+/* Token after an abandoned container `tok`: follow the chain of resume
+   hints (the last child entered at each level) down to a completed or
+   unhinted container, then skip up level by level. Same result encoding
+   as yyjson_od__skip. */
+YYJSON_OD_PURE yyjson_api uint64_t yyjson_od__resume(
+    const unsigned char *buf, const uint32_t *idx, uint32_t n,
+    const yyjson_od__ph *ph, uint32_t end_of, uint32_t end_ip, uint32_t tok);
+
 
 /* Token after the container that starts at `tok`: the handoff left by the
    child iterator that completed it (one compare, simdjson-style), else a
-   skip through the index: from the last value the child yielded if it was
-   abandoned after partial reading (past that value if it was a completed
-   container), else from the start. 0 on error. */
+   skip through the index: from the last grandchild container the child
+   entered if it was abandoned (past it if that one was completed), else
+   from the start. 0 on error. */
 yyjson_api_inline uint32_t yyjson_od__after(yyjson_od_doc *d, uint32_t tok) {
     uint64_t r;
     uint32_t ip = tok + 1;
     if (d->end_of == tok) return d->end_ip;
-    /* an abandoned child: resume from its last position */
-    if (d->ph[tok % YYJSON_OD_PH_SIZE].of == tok) {
-        ip = d->ph[tok % YYJSON_OD_PH_SIZE].ip;
-        if (d->end_of == ip) ip = d->end_ip; /* its value was completed */
-    }
-    r = yyjson_od__skip(d->buf, d->idx, d->ntok, ip, 1, 0);
+    if (d->ph[tok % YYJSON_OD_PH_SIZE].of == tok) /* abandoned child */
+        r = yyjson_od__resume(d->buf, d->idx, d->ntok, d->ph, d->end_of,
+                              d->end_ip, tok);
+    else
+        r = yyjson_od__skip(d->buf, d->idx, d->ntok, ip, 1, 0);
     if (yyjson_od_unlikely((uint32_t)(r >> 32) != 0)) {
         yyjson_od__fail(d, YYJSON_OD_TAPE, tok);
         return 0;
@@ -471,6 +480,12 @@ yyjson_api_inline bool yyjson_od__begin(yyjson_od_val *v, yyjson_od_iter *it,
 #endif
     if (yyjson_od_unlikely(YYJSON_OD_CH(d, tok) != open))
         return yyjson_od__fail(d, YYJSON_OD_INCORRECT_TYPE, tok);
+    {   /* resume hint for the parent, should this child be abandoned (the
+           root's slot holds ~0, which matches no token) */
+        uint32_t p = v->par;
+        d->ph[p % YYJSON_OD_PH_SIZE].of = p;
+        d->ph[p % YYJSON_OD_PH_SIZE].ip = tok;
+    }
 #if YYJSON_OD_CHECKS
     {   /* the value must be the current one of a live iterator, and a
            container is iterated once */
@@ -555,7 +570,7 @@ yyjson_api_inline bool yyjson_od_obj_next(yyjson_od_iter *it,
     key->len = (size_t)(e - s);
     ip += 2;
     it->ip = ip;
-    YYJSON_OD__HINT(d, it, ip);
+    val->par = it->otok - 1;
     val->doc = d;
     val->tok = ip;
     YYJSON_OD__CK_CUR(it, val, ip);
@@ -586,7 +601,7 @@ yyjson_api_inline bool yyjson_od_obj_find(yyjson_od_iter *it, const char *key,
         if (s + klen < q && buf[s + klen] == '"' &&
             memcmp(buf + s, key, klen) == 0) {
             it->ip = ip;
-            YYJSON_OD__HINT(d, it, ip);
+            val->par = it->otok - 1;
             val->doc = d;
             val->tok = ip;
             YYJSON_OD__CK_CUR(it, val, ip);
