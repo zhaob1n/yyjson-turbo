@@ -10796,6 +10796,26 @@ static_inline const char_enc_type *get_enc_table_with_flag(
     }
 }
 
+#if YYJSON_STR_SIMD_AVX2 || YYJSON_STR_SIMD_AVX512
+/** Copy clean ASCII 32 bytes at a time (outlined to keep write_str codegen
+    unchanged). Returns the first unconsumed source byte. */
+static yyjson_noinline const u8 *write_ascii_simd(u8 *cur, const u8 *src,
+                                                  const u8 *end) {
+    while (end - src >= 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
+        __m256i m = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
+                            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
+                            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v)));
+        if (_mm256_movemask_epi8(m)) break;
+        _mm256_storeu_si256((__m256i *)(void *)cur, v);
+        cur += 32; src += 32;
+    }
+    return src;
+}
+#endif
+
 /** Write raw string. */
 static_inline u8 *write_raw(u8 *cur, const u8 *raw, usize raw_len) {
     memcpy(cur, raw, raw_len);
@@ -10878,16 +10898,9 @@ copy_ascii:
         repeat16_incr(expr_jump)
         byte_copy_16(cur, src);
         cur += 16; src += 16;
-        while (end - src >= 32) {
-            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
-            __m256i m = _mm256_or_si256(
-                _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
-                                _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
-                _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
-                                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v)));
-            if (_mm256_movemask_epi8(m)) break;
-            _mm256_storeu_si256((__m256i *)(void *)cur, v);
-            cur += 32; src += 32;
+        {
+            const u8 *s2 = write_ascii_simd(cur, src, end);
+            cur += s2 - src; src = s2;
         }
     }
 #endif
