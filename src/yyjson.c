@@ -4826,6 +4826,37 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #undef return_err
 }
 
+#if YYJSON_STR_SIMD_AVX512 || YYJSON_STR_SIMD_AVX2
+/** Long-string scan kept out of line so it does not change the register
+    allocation of the (inlined) string and number readers. Returns the first
+    byte that is '"', '\\' or < 0x20, or the position where fewer than one
+    vector of input remains; the scalar loop continues from there. */
+static_noinline u8 *skip_ascii_simd(u8 *src, u8 *eof) {
+#if YYJSON_STR_SIMD_AVX512
+    while (eof - src >= 64) {
+        __m512i v = _mm512_loadu_si512((const void *)src);
+        __mmask64 m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"')) |
+                      _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\\')) |
+                      _mm512_cmplt_epi8_mask(v, _mm512_set1_epi8(0x20));
+        if (m) return src + __builtin_ctzll(m);
+        src += 64;
+    }
+#else
+    while (eof - src >= 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
+        __m256i m = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
+                            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v));
+        u32 mask = (u32)_mm256_movemask_epi8(m);
+        if (mask) return src + __builtin_ctz(mask);
+        src += 32;
+    }
+#endif
+    return src;
+}
+#endif
+
 /**
  Read a JSON string.
  @param quo The quote character (single quote or double quote).
@@ -4894,27 +4925,9 @@ skip_ascii:
     repeat16_incr(expr_jump)
     src += 16;
 #if YYJSON_STR_SIMD_AVX512
-    /* long string: 64 bytes per step (only after 16 scalar bytes) */
-    while (eof - src >= 64) {
-        __m512i v = _mm512_loadu_si512((const void *)src);
-        __mmask64 m = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('"')) |
-                      _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8('\\')) |
-                      _mm512_cmplt_epi8_mask(v, _mm512_set1_epi8(0x20));
-        if (m) { src += __builtin_ctzll(m); goto skip_ascii_end; }
-        src += 64;
-    }
+    if (eof - src >= 64) src = skip_ascii_simd(src, eof);
 #elif YYJSON_STR_SIMD_AVX2
-    /* long string: 32 bytes per step (only after 16 scalar bytes) */
-    while (eof - src >= 32) {
-        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
-        __m256i m = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
-                            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
-            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v));
-        u32 mask = (u32)_mm256_movemask_epi8(m);
-        if (mask) { src += __builtin_ctz(mask); goto skip_ascii_end; }
-        src += 32;
-    }
+    if (eof - src >= 32) src = skip_ascii_simd(src, eof);
 #endif
     goto skip_ascii;
     repeat16_incr(expr_stop)
@@ -8156,7 +8169,7 @@ fallback:
     return yyjson_read_opts(dat, len, flg | S1_NO_FORCE_BIT, alc_ptr, err);
 }
 
-yyjson_doc *yyjson_read_opts(char *dat, usize len,
+static_noinline yyjson_doc *read_opts_def(char *dat, usize len,
                              yyjson_read_flag flg,
                              const yyjson_alc *alc_ptr,
                              yyjson_read_err *err) {
@@ -8178,16 +8191,6 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     if (unlikely(!dat)) return_err(0, INVALID_PARAMETER, "input data is NULL");
     if (unlikely(!len)) return_err(0, INVALID_PARAMETER, "input length is 0");
 
-    /* optional readers live out of line so this function compiles as
-       upstream's; one test of two flag bits on the default path */
-#if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
-    if (!(flg & ~(YYJSON_READ_INSITU | YYJSON_READ_NO_NUL_TERM)))
-        flg |= YYJSON_READ_STAGE1; /* testing: route eligible reads */
-    flg &= ~S1_NO_FORCE;
-#endif
-    if (unlikely(flg & (YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM))) {
-        return s1_read_opts(dat, len, flg, alc_ptr, err);
-    }
     /* add 4-byte zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         hdr = (u8 *)dat;
@@ -8252,6 +8255,27 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     return doc;
 
 #undef return_err
+}
+
+yyjson_doc *yyjson_read_opts(char *dat, usize len,
+                             yyjson_read_flag flg,
+                             const yyjson_alc *alc_ptr,
+                             yyjson_read_err *err) {
+    /* the default reader is a separate function so the optional readers
+       cannot perturb its code generation */
+#if !defined(YYJSON_DISABLE_STAGE1) && defined(YYJSON_STAGE1_FORCE)
+    if (!(flg & ~(YYJSON_READ_INSITU | YYJSON_READ_NO_NUL_TERM)))
+        flg |= YYJSON_READ_STAGE1; /* testing: route eligible reads */
+    flg &= ~S1_NO_FORCE;
+#endif
+    if (likely(!(flg & (YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM))) ||
+        !dat || !len) {
+        return read_opts_def(dat, len,
+            flg & ~(YYJSON_READ_STAGE1 | YYJSON_READ_NO_NUL_TERM),
+            alc_ptr, err);
+    } else {
+        return s1_read_opts(dat, len, flg, alc_ptr, err);
+    }
 }
 
 #if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
