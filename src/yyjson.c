@@ -7010,6 +7010,46 @@ static_inline void s1_mov(u8 *dst, const u8 *src, usize n) {
 #endif
 }
 
+/* "\\u" at p (bytes 0x5C 0x75) */
+static_inline bool s1_is_u(const u8 *p) {
+    u16 t; memcpy(&t, p, 2); return t == 0x755C;
+}
+/* Decode 4 consecutive \uXXXX escapes (24 bytes at src, all four "\u"
+   prefixes already checked) when every code point is in 0x0800-0xFFFF and is
+   not a surrogate: writes 12 UTF-8 bytes (16-byte store, dst <= src, stays
+   inside the consumed escapes). Returns false (nothing written) otherwise. */
+static_inline bool s1_u4_bmp3(const u8 *src, u8 *dst) {
+    __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(src + 2));
+    u32 t3; __m128i lc, d, a, isd, isa, v, cp, w, lo;
+    memcpy(&t3, src + 20, 4);
+    x = _mm_shuffle_epi8(x, _mm_setr_epi8(0, 1, 2, 3, 6, 7, 8, 9,
+                                          12, 13, 14, 15, -1, -1, -1, -1));
+    x = _mm_insert_epi32(x, (int)t3, 3);
+    lc = _mm_or_si128(x, _mm_set1_epi8(0x20));
+    d = _mm_sub_epi8(lc, _mm_set1_epi8('0'));
+    a = _mm_sub_epi8(lc, _mm_set1_epi8('a'));
+    isd = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    isa = _mm_cmpeq_epi8(_mm_min_epu8(a, _mm_set1_epi8(5)), a);
+    if (_mm_movemask_epi8(_mm_or_si128(isd, isa)) != 0xFFFF) return false;
+    v = _mm_blendv_epi8(_mm_add_epi8(a, _mm_set1_epi8(10)), d, isd);
+    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x0110)); /* hi*16 + lo */
+    cp = _mm_madd_epi16(v, _mm_set1_epi32(0x00010100)); /* hi*256 + lo */
+    /* need 0x800 <= cp and (cp & 0xF800) != 0xD800 */
+    if (_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(
+            _mm_cmplt_epi32(cp, _mm_set1_epi32(0x800)),
+            _mm_cmpeq_epi32(_mm_and_si128(cp, _mm_set1_epi32(0xF800)),
+                            _mm_set1_epi32(0xD800)))))) return false;
+    w = _mm_or_si128(_mm_srli_epi32(cp, 12), _mm_set1_epi32(0x8080E0));
+    lo = _mm_and_si128(_mm_slli_epi32(cp, 2), _mm_set1_epi32(0x3F00));
+    w = _mm_or_si128(w, lo);
+    lo = _mm_and_si128(_mm_slli_epi32(cp, 16), _mm_set1_epi32(0x3F0000));
+    w = _mm_or_si128(w, lo);
+    w = _mm_shuffle_epi8(w, _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10,
+                                          12, 13, 14, -1, -1, -1, -1));
+    _mm_storeu_si128((__m128i *)(void *)dst, w);
+    return true;
+}
+
 /* Unescape a string whose special bytes (backslash / control) are known from
    the stage-1 `spc` bitmap: copy runs between them with vector moves instead
    of yyjson's per-byte loop. Returns false on any error (caller falls back). */
@@ -7056,7 +7096,37 @@ esc_again:
             case 'r':  *dst++ = '\r'; src += 2; break;
             case 't':  *dst++ = '\t'; src += 2; break;
             case 'u':
-                if (!read_uni_esc(&src, &dst, &msg)) return false;
+                /* runs of BMP \uXXXX: one 4-byte store per escape (dst + 4 <=
+                   src + 4 stays inside the escape being consumed) */
+                for (;;) {
+                    u16 ux; u32 uw;
+                    while (s_end - src >= 24 && s1_is_u(src + 6) &&
+                           s1_is_u(src + 12) && s1_is_u(src + 18) &&
+                           s1_u4_bmp3(src, dst)) {
+                        src += 24; dst += 12;
+                        if (!s1_is_u(src)) goto u_done;
+                    }
+                    if (unlikely(!hex_load_4(src + 2, &ux) ||
+                                 (ux & 0xF800) == 0xD800)) {
+                        if (!read_uni_esc(&src, &dst, &msg)) return false;
+                        break;
+                    }
+                    if (ux >= 0x800) {
+                        uw = (u32)(0xE0 | (ux >> 12)) |
+                            ((u32)(0x80 | ((ux >> 6) & 0x3F)) << 8) |
+                            ((u32)(0x80 | (ux & 0x3F)) << 16);
+                        byte_copy_4(dst, &uw); dst += 3;
+                    } else if (ux >= 0x80) {
+                        uw = (u32)(0xC0 | (ux >> 6)) |
+                            ((u32)(0x80 | (ux & 0x3F)) << 8);
+                        byte_copy_4(dst, &uw); dst += 2;
+                    } else {
+                        *dst++ = (u8)ux;
+                    }
+                    src += 6;
+                    if (src >= s_end || src[0] != '\\' || src[1] != 'u') break;
+                }
+u_done:
                 break;
             default: return false;
         }
