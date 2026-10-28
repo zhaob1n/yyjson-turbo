@@ -233,6 +233,8 @@ yyjson_api const unsigned char *yyjson_od__num(const unsigned char *cur,
 __attribute__((const))
 #endif
 yyjson_api uint64_t yyjson_od__f64(uint64_t sig, int32_t exp, int sign);
+/* pow10 significand table of the fast conversion (NULL if disabled) */
+yyjson_api extern const uint64_t *const yyjson_od__p10;
 /* The out-of-line helpers below never receive the doc: they take the
    buffer/index by value and return results by value, and are declared
    pure/const. A call on a cold path then cannot clobber the caller's doc,
@@ -782,6 +784,55 @@ static const uint32_t yyjson_od__pow10u[9] = {
 /* Fast number parser. Returns the end of the number, or NULL when the slow
    path must decide (invalid input, >19 digits, -0, big exponents, inexact
    Eisel-Lemire). Results are bit-identical to the yyjson DOM reader. */
+/* Inline copy of the reader's fast decimal-to-double conversion (the
+   Eisel-Lemire step on the shared pow10 table; simdjson inlines the same
+   step): bits of the double, or ~0 when the generic reader must decide.
+   Canada-style 17-digit reals take this path for every number, so the
+   call into the library was a large share of their cost. */
+#if defined(__SIZEOF_INT128__) && (defined(__GNUC__) || defined(__clang__))
+__extension__ typedef unsigned __int128 yyjson_od__u128;
+yyjson_api_inline uint64_t yyjson_od__f64i(uint64_t sig, int32_t e, int neg) {
+    const uint64_t *t = yyjson_od__p10;
+    uint64_t sig1, hi, lo, hi2, add, bits, raw;
+    yyjson_od__u128 m;
+    int32_t exp2, idx;
+    uint32_t lz;
+    if (yyjson_od_unlikely(!t || sig == 0 || !(e > -307 && e < 288)))
+        return yyjson_od__f64(sig, e, neg);
+    idx = (e + 343) * 2;
+    exp2 = (e * 217706 - 4128768) >> 16;
+    lz = (uint32_t)__builtin_clzll(sig);
+    sig1 = sig << lz;
+    exp2 -= (int32_t)lz;
+    m = (yyjson_od__u128)sig1 * t[idx];
+    hi = (uint64_t)(m >> 64);
+    lo = (uint64_t)m;
+    bits = hi & (((uint64_t)1 << 9) - 1);
+    if (yyjson_od_unlikely(!(bits - 1 < (((uint64_t)1 << 9) - 2)))) {
+        m = (yyjson_od__u128)sig1 * t[idx + 1];
+        hi2 = (uint64_t)(m >> 64);
+        add = lo + hi2;
+        if (!(add + 1 > (uint64_t)1)) return ~(uint64_t)0;
+        hi += (add < lo || add < hi2);
+    }
+    lz = hi < ((uint64_t)1 << 63);
+    hi <<= lz;
+    exp2 -= (int32_t)lz;
+    exp2 += 64;
+    hi += (hi & ((uint64_t)1 << 10)) ? ((uint64_t)1 << 10) : 0;
+    if (hi < ((uint64_t)1 << 10)) {
+        hi = (uint64_t)1 << 63;
+        exp2 += 1;
+    }
+    hi >>= 11;
+    exp2 += 11 + 52 + 1023;
+    raw = ((uint64_t)exp2 << 52) | (hi & ((((uint64_t)1 << 52)) - 1));
+    return ((uint64_t)(neg != 0) << 63) | raw;
+}
+#else
+#define yyjson_od__f64i yyjson_od__f64
+#endif
+
 yyjson_api_inline const unsigned char *yyjson_od__pnum(const unsigned char *p,
                                                        yyjson_val *v) {
     static const double pow10[23] = {
@@ -893,7 +944,7 @@ yyjson_api_inline const unsigned char *yyjson_od__pnum(const unsigned char *p,
 #else
     (void)pow10;
 #endif
-    x = yyjson_od__f64(sig, e, neg);
+    x = yyjson_od__f64i(sig, e, neg);
     if (yyjson_od_unlikely(x == ~(uint64_t)0)) return NULL;
     v->tag = YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL;
     v->uni.u64 = x;

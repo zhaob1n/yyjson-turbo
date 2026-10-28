@@ -8111,6 +8111,13 @@ yyjson_api const u8 *yyjson_od__num(const u8 *cur, const u8 *eof,
    generic reader must decide. Touches no caller-visible memory, so the
    header can declare it `const` and the caller's cursor stays in
    registers across the call. */
+#if !YYJSON_DISABLE_FAST_FP_CONV
+yyjson_api extern const u64 *const yyjson_od__p10;
+const u64 *const yyjson_od__p10 = pow10_sig_table;
+#else
+yyjson_api extern const u64 *const yyjson_od__p10;
+const u64 *const yyjson_od__p10 = NULL;
+#endif
 yyjson_api u64 yyjson_od__f64(u64 sig, i32 exp, int sign) {
 #if !YYJSON_DISABLE_FAST_FP_CONV
     yyjson_val v;
