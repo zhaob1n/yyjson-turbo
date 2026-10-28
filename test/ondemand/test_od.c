@@ -471,6 +471,111 @@ static void fuzz_valid(long iters) {
     if (mism) g_fail++;
 }
 
+/* Differential number fuzz: every number getter must agree bit-for-bit
+   with the yyjson DOM reader (subnormals, long mantissas, big exponents,
+   halfway cases from %.17g of random bit patterns, integer edges). */
+static size_t gen_num(char *m) {
+    size_t n = 0;
+    unsigned k = rnd() % 10, i, nd;
+    if (k < 3) { /* random double bits, printed round-trip */
+        uint64_t b = ((uint64_t)rnd() << 32) | rnd();
+        double d;
+        if (rnd() % 4 == 0) b &= ((uint64_t)1 << 52) - 1; /* subnormal */
+        memcpy(&d, &b, 8);
+        if (d != d || d - d != 0) d = 1.0;
+        if (rnd() % 2) return (size_t)sprintf(m, "%.17g", d);
+        return (size_t)sprintf(m, "%.*e", (int)(rnd() % 25), d);
+    }
+    if (rnd() % 3 == 0) m[n++] = '-';
+    if (rnd() % 6 == 0) m[n++] = '0';
+    else {
+        nd = rnd() % 8 == 0 ? 1 + rnd() % 26 : 1 + rnd() % 4;
+        m[n++] = (char)('1' + rnd() % 9);
+        for (i = 1; i < nd; i++) m[n++] = (char)('0' + rnd() % 10);
+        if (k == 3) { /* integer edges */
+            static const char *e[] = {"9223372036854775807",
+                "9223372036854775808", "9223372036854775809",
+                "18446744073709551615", "18446744073709551616",
+                "9007199254740993", "99999999999999999999"};
+            n = (size_t)(m[0] == '-');
+            strcpy(m + n, e[rnd() % 7]);
+            return strlen(m);
+        }
+    }
+    if (rnd() % 3) {
+        m[n++] = '.';
+        nd = rnd() % 4 == 0 ? 1 + rnd() % 40 : 1 + rnd() % 17;
+        for (i = 0; i < nd; i++) m[n++] = (char)('0' + rnd() % 10);
+    }
+    if (rnd() % 3 == 0) {
+        static const int ex[] = {0, 1, 22, 23, 300, 307, 308, 309, 323,
+                                 324, 325, 343, 400, 9999};
+        m[n++] = rnd() % 2 ? 'e' : 'E';
+        if (rnd() % 2) m[n++] = rnd() % 2 ? '-' : '+';
+        n += (size_t)sprintf(m + n, "%d",
+                             rnd() % 2 ? ex[rnd() % 14] : (int)(rnd() % 400));
+    }
+    return n;
+}
+
+static void fuzz_num(long iters) {
+    char src[256], js[300], buf[300 + YYJSON_OD_PADDING];
+    long it, mism = 0;
+    for (it = 0; it < iters; it++) {
+        size_t n = gen_num(src);
+        yyjson_doc *dd;
+        yyjson_val *dv = NULL;
+        yyjson_val nv;
+        yyjson_od_doc *d;
+        yyjson_od_val r, v;
+        yyjson_od_iter ai;
+        double f = 0, df = 0;
+        int64_t si = 0;
+        uint64_t ui = 0;
+        int dok, ok, bad = 0, g;
+        src[n] = 0;
+        sprintf(js, "[%s,%s,%s,%s]", src, src, src, src);
+        dd = yyjson_read(js, strlen(js), 0);
+        dok = dd != NULL;
+        if (dok) dv = yyjson_arr_get_first(yyjson_doc_get_root(dd));
+        d = P_parse(js, buf);
+        r = yyjson_od_doc_root(d);
+        ok = yyjson_od_get_arr(&r, &ai);
+        for (g = 0; g < 4 && ok; g++) {
+            int gok;
+            if (!yyjson_od_arr_next(&ai, &v)) { ok = 0; break; }
+            if (g == 0) {
+                gok = yyjson_od_get_num(&v, &nv);
+                if (gok != dok || (gok && (nv.tag != dv->tag ||
+                                           nv.uni.u64 != dv->uni.u64))) bad = 1;
+            } else if (g == 1) {
+                gok = yyjson_od_get_real(&v, &f);
+                if (dok) df = yyjson_get_num(dv);
+                if (gok != dok || (gok && memcmp(&f, &df, 8))) bad = 2;
+            } else if (g == 2) {
+                gok = yyjson_od_get_sint(&v, &si);
+                if (dok && gok != (yyjson_is_sint(dv) ||
+                    (yyjson_is_uint(dv) && dv->uni.u64 <= (uint64_t)INT64_MAX)))
+                    bad = 3;
+                if (gok && dok && si != dv->uni.i64) bad = 3;
+            } else {
+                gok = yyjson_od_get_uint(&v, &ui);
+                if (dok && gok != yyjson_is_uint(dv)) bad = 4;
+                if (gok && dok && ui != dv->uni.u64) bad = 4;
+            }
+            if (!gok) break;
+        }
+        if (!dok && ok && g == 4) bad = 5;
+        if (bad) {
+            if (mism < 10) fprintf(stderr, "num mismatch %d: %s\n", bad, src);
+            mism++;
+        }
+        yyjson_doc_free(dd);
+    }
+    printf("number fuzz: %ld iters, %ld mismatches\n", iters, mism);
+    if (mism) g_fail++;
+}
+
 int main(int argc, char **argv) {
     long iters = argc > 1 ? atol(argv[1]) : 20000;
     if (argc > 2) rs ^= (uint64_t)atol(argv[2]) * 2654435761u;
@@ -478,6 +583,7 @@ int main(int argc, char **argv) {
     unit();
     fuzz(iters, argv + 3, argc > 3 ? argc - 3 : 0);
     fuzz_valid(iters / 2);
+    fuzz_num(iters * 4);
     yyjson_od_parser_free(P);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);
     (void)has_esc_key;
