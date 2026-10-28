@@ -195,6 +195,19 @@ yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p, const char *buf,
     return d;
 }
 
+int yyjson_od_iterate(yyjson_od_parser *p, const char *buf, size_t len,
+                      yyjson_od_doc *doc) {
+    int code;
+    yyjson_od_doc *d = yyjson_od_parse(p, buf, len, &code);
+    if (!d) {
+        memset(doc, 0, sizeof(*doc));
+        doc->err = code;
+        return code;
+    }
+    *doc = *d;
+    return YYJSON_OD_OK;
+}
+
 bool yyjson_od__fail(yyjson_od_doc *d, int code) {
     if (!d->err) {
         d->err = code;
@@ -211,6 +224,16 @@ bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target) {
     const unsigned char *buf = d->buf;
     const uint32_t *idx = d->idx;
     uint32_t ip = d->ip, n = d->ntok, depth = d->depth;
+    /* bounds are checked once per 4 tokens: the 4 sentinels at ntok keep
+       the over-read in bounds, and ip > ntok is caught below */
+    while (ip + 4 <= n) {
+#define OD_SKIP_STEP \
+        depth = (uint32_t)((int32_t)depth + yyjson_od__dtab[buf[idx[ip]]]); \
+        ip++; \
+        if (depth <= target) goto done;
+        OD_SKIP_STEP OD_SKIP_STEP OD_SKIP_STEP OD_SKIP_STEP
+#undef OD_SKIP_STEP
+    }
     while (depth > target) {
         if (yyjson_od_unlikely(ip >= n)) {
             d->ip = ip;
@@ -220,8 +243,11 @@ bool yyjson_od__skip_to(yyjson_od_doc *d, uint32_t target) {
         depth = (uint32_t)((int32_t)depth + yyjson_od__dtab[buf[idx[ip]]]);
         ip++;
     }
+done:
     d->ip = ip;
     d->depth = depth;
+    if (yyjson_od_unlikely(depth != target)) /* unbalanced brackets */
+        return yyjson_od__fail(d, YYJSON_OD_TAPE);
     return true;
 }
 

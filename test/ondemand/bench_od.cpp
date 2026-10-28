@@ -70,7 +70,7 @@ struct Tw { sv created_at; u64 id; sv text; u64 reply; u64 uid; sv sname; u64 rt
 struct PartialTweets {
   typedef std::vector<Tw> R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter a = oda(odf(root, "statuses")); yyjson_od_val tv;
     while (yyjson_od_arr_next(&a, &tv)) {
       yyjson_od_iter t = odo(tv); Tw w;
@@ -121,7 +121,7 @@ struct TopR { int64_t rt = -1; sv sname, text; bool operator==(const TopR &o) co
 struct TopTweet {
   typedef TopR R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter a = oda(odf(root, "statuses")); yyjson_od_val tv;
     while (yyjson_od_arr_next(&a, &tv)) {
       yyjson_od_iter t = odo(tv);
@@ -160,7 +160,7 @@ struct TopTweet {
 struct DistinctUserId {
   typedef std::vector<u64> R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter a = oda(odf(root, "statuses")); yyjson_od_val tv, rv;
     while (yyjson_od_arr_next(&a, &tv)) {
       yyjson_od_iter t = odo(tv);
@@ -202,7 +202,7 @@ struct CitmR { std::vector<std::pair<sv, sv>> names; u64 perf_id = 0, event_id =
 struct Citm {
   typedef CitmR R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter an = odo(odf(root, "areaNames")); yyjson_od_str k; yyjson_od_val v, pv, x, y;
     while (yyjson_od_obj_next(&an, &k, &v)) r.names.push_back({sv(k.ptr, k.len), ods(v)});
     yyjson_od_iter ps = oda(odf(root, "performances"));
@@ -261,7 +261,7 @@ struct CanR { double x = 0, y = 0; u64 n = 0; bool operator==(const CanR &o) con
 struct Canada {
   typedef CanR R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter fs = oda(odf(root, "features")); yyjson_od_val f, ring, pt, x;
     while (yyjson_od_arr_next(&fs, &f)) {
       yyjson_od_iter fo = odo(f); yyjson_od_iter g = odo(odf(fo, "geometry"));
@@ -307,7 +307,7 @@ struct GsR { sv a, b, c; bool operator==(const GsR &o) const { return a == o.a &
 struct Gsoc {
   typedef std::vector<GsR> R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d)); yyjson_od_str k; yyjson_od_val v;
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d)); yyjson_od_str k; yyjson_od_val v;
     while (yyjson_od_obj_next(&root, &k, &v)) {
       yyjson_od_iter p = odo(v); GsR g; g.a = ods(odf(p, "name"));
       { yyjson_od_iter s = odo(odf(p, "sponsor")); g.b = ods(odf(s, "name")); }
@@ -338,7 +338,7 @@ struct NumR { double s = 0; u64 n = 0; bool operator==(const NumR &o) const { re
 struct Numbers {
   typedef NumR R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter a = oda(yyjson_od_doc_root(d)); yyjson_od_val v;
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter a = oda(yyjson_od_doc_root(d)); yyjson_od_val v;
     while (yyjson_od_arr_next(&a, &v)) { r.s += odd(v); r.n++; }
     odend(d);
   }
@@ -352,7 +352,7 @@ struct UcR { sv name, ver; u64 ndep; bool operator==(const UcR &o) const { retur
 struct Update {
   typedef std::vector<UcR> R;
   static void od(Ctx &c, R &r) {
-    yyjson_od_doc *d = c.od(); yyjson_od_iter root = odo(yyjson_od_doc_root(d));
+    yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; yyjson_od_iter root = odo(yyjson_od_doc_root(d));
     yyjson_od_iter pl = odo(odf(root, "plugins")); yyjson_od_str k; yyjson_od_val v, x;
     while (yyjson_od_obj_next(&pl, &k, &v)) {
       yyjson_od_iter p = odo(v); UcR u; u.ndep = 0;
@@ -431,7 +431,7 @@ static void sdwalk(dom::element v, WalkR &r) {
 }
 struct Walk {
   typedef WalkR R;
-  static void od(Ctx &c, R &r) { yyjson_od_doc *d = c.od(); odwalk(yyjson_od_doc_root(d), r); CHECK(yyjson_od_doc_finish(d)); }
+  static void od(Ctx &c, R &r) { yyjson_od_doc ld; CHECK(yyjson_od_iterate(c.odp, c.in->buf, c.in->len, &ld) == 0); yyjson_od_doc *d = &ld; odwalk(yyjson_od_doc_root(d), r); CHECK(yyjson_od_doc_finish(d)); }
   static void sj(Ctx &c, R &r) { auto doc = c.sj(); ondemand::value root = doc.get_value(); sjwalk(root, r); CHECK(doc.at_end()); }
   static void yy(Ctx &c, R &r) { yyjson_doc *d = c.yy(); yywalk(yyjson_doc_get_root(d), r); yyjson_doc_free(d); }
   static void sd(Ctx &c, R &r) { sdwalk(c.sd(), r); }
@@ -453,6 +453,11 @@ template <class T> static void prof(Ctx &c, int m, int it) {
 static const char *IMPL[4] = {"yyjson_od", "simdjson_od", "yyjson_dom", "simdjson_dom"};
 template <class T> static void run(Ctx &c, const char *task, const Input &in, int rounds, FILE *raw) {
   c.in = &in;
+  if (getenv("OD_ICNT")) { int m = atoi(getenv("OD_ICNT")); typename T::R x0, x1;
+    switch (m) { case 0: T::od(c, x0); break; default: T::sj(c, x0); }
+    __asm__ __volatile__("int3");
+    switch (m) { case 0: T::od(c, x1); break; default: T::sj(c, x1); }
+    __asm__ __volatile__("int3"); exit(0); }
   if (getenv("OD_PROF")) prof<T>(c, atoi(getenv("OD_PROF")), atoi(getenv("OD_PROF_IT") ? getenv("OD_PROF_IT") : "2000"));
   typename T::R res[4];
   T::od(c, res[0]); T::sj(c, res[1]); T::yy(c, res[2]); T::sd(c, res[3]);

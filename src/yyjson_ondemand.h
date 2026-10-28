@@ -133,6 +133,17 @@ yyjson_api yyjson_od_doc *yyjson_od_parse(yyjson_od_parser *p,
                                           const char *buf, size_t len,
                                           int *code);
 
+/** Like yyjson_od_parse, but fills a caller-owned document (usually a
+    local variable). This is the fastest way to iterate: a document whose
+    address does not escape lets the compiler keep the cursor in registers
+    across the inlined iteration functions. The document stays valid until
+    the next parse with the same parser; copies of it are independent
+    cursors over the same index.
+    @return YYJSON_OD_OK, or the error code (also stored in the document,
+    whose iteration then fails). */
+yyjson_api int yyjson_od_iterate(yyjson_od_parser *p, const char *buf,
+                                 size_t len, yyjson_od_doc *doc);
+
 /** Error code of the document (YYJSON_OD_OK if none). */
 yyjson_api_inline int yyjson_od_doc_err(const yyjson_od_doc *d) {
     return d->err;
@@ -391,31 +402,58 @@ yyjson_api_inline bool yyjson_od_obj_find(yyjson_od_iter *it, const char *key,
     yyjson_od_doc *d = it->doc;
     const unsigned char *buf = d->buf;
     const uint32_t *idx = d->idx;
-    uint32_t ip, s;
-    while (yyjson_od__sep(it, '}')) {
-        ip = d->ip;
+    uint32_t ip, s, ntok = d->ntok;
+    unsigned char c;
+    if (!yyjson_od__sep(it, '}')) return false;
+    /* the cursor lives in a local until a match or a container to skip */
+    ip = d->ip;
+    for (;;) {
         s = idx[ip] + 1;
-        if (yyjson_od_unlikely(buf[s - 1] != '"' ||
-                               buf[idx[ip + 1]] != ':' || ip + 2 >= d->ntok)) {
-            it->state = 2;
-            return yyjson_od__fail(d, YYJSON_OD_TAPE);
-        }
+        if (yyjson_od_unlikely(buf[s - 1] != '"' || ip + 2 >= ntok ||
+                               buf[idx[ip + 1]] != ':'))
+            goto tape;
         ip += 2;
-        d->ip = ip;
-        it->vtok = ip;
-        if (s + klen < d->len && buf[s + klen] == '"' &&
-            memcmp(buf + s, key, klen) == 0 &&
-            yyjson_od__str_end(d, ip - 2) == s + klen) {
-            if (yyjson_od_unlikely(!yyjson_od__vtab[YYJSON_OD_CH(d, ip)])) {
-                it->state = 2;
-                return yyjson_od__fail(d, YYJSON_OD_TAPE);
-            }
+        /* a quote right after the bytes of a well-formed escaped key is
+           the closing quote, so no str_end scan is needed */
+        if (buf[s + klen] == '"' && s + klen < d->len &&
+            memcmp(buf + s, key, klen) == 0) {
+            if (yyjson_od_unlikely(!yyjson_od__vtab[buf[idx[ip]]]))
+                goto tape;
+            d->ip = ip;
+            it->vtok = ip;
             val->doc = d;
             val->tok = ip;
             return true;
         }
+        c = buf[idx[ip]];
+        ip++;
+        if (c == '{' || c == '[') {
+            d->ip = ip;
+            d->depth = it->depth + 1;
+            if (yyjson_od_unlikely(!yyjson_od__skip_to(d, it->depth))) {
+                it->state = 2;
+                return false;
+            }
+            ip = d->ip;
+        } else if (yyjson_od_unlikely(!yyjson_od__vtab[c])) {
+            ip--;
+            goto tape;
+        }
+        c = buf[idx[ip]]; /* sentinels keep this in bounds */
+        ip++;
+        if (yyjson_od_likely(c == ',')) continue;
+        d->ip = ip;
+        it->state = 2;
+        if (yyjson_od_likely(c == '}' && ip <= ntok)) {
+            d->depth--;
+            return false;
+        }
+        return yyjson_od__fail(d, YYJSON_OD_TAPE);
     }
-    return false;
+tape:
+    d->ip = ip;
+    it->state = 2;
+    return yyjson_od__fail(d, YYJSON_OD_TAPE);
 }
 
 /** Find a member by raw key in any order (like simdjson's

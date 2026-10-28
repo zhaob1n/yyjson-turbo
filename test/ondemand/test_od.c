@@ -316,6 +316,35 @@ static void unit(void) {
 
     /* control characters inside strings are rejected at parse time */
     CHECK(P_parse("[\"a\tb\"]", buf) == NULL);
+
+    /* caller-stack doc via yyjson_od_iterate; near-end keys, skip_to tails */
+    {
+        static const char *docs[] = {"{\"a\":1,\"b\":[[[[[1]]]],{\"c\":{}}],\"zz\":2}",
+                                     "{\"a\":{\"x\":[1,2,3,4,5,6,7,8,9]},\"k\":3}",
+                                     "{\"a\":[[[[[[",  "{\"k\"", "{\"k\":", "{\"a\":[]]}"};
+        yyjson_od_doc sd;
+        int q;
+        for (q = 0; q < 6; q++) {
+            size_t l = strlen(docs[q]);
+            int e;
+            memcpy(buf, docs[q], l); memset(buf + l, 0, YYJSON_OD_PADDING);
+            e = yyjson_od_iterate(P, buf, l, &sd);
+            if (q < 2) {
+                CHECK(e == 0);
+                r = yyjson_od_doc_root(&sd);
+                CHECK(yyjson_od_get_obj(&r, &it));
+                CHECK(yyjson_od_obj_find(&it, q ? "k" : "zz", q ? 1 : 2, &v) && yyjson_od_get_uint(&v, &u64) && u64 == (q ? 3u : 2u));
+                CHECK(!yyjson_od_obj_find(&it, "nope", 4, &v));
+                CHECK(yyjson_od_doc_finish(&sd));
+            } else if (e == 0) {
+                r = yyjson_od_doc_root(&sd);
+                if (yyjson_od_get_obj(&r, &it)) {
+                    CHECK(!yyjson_od_obj_find(&it, "zz", 2, &v) || !yyjson_od_doc_finish(&sd));
+                }
+                CHECK(!yyjson_od_doc_finish(&sd));
+            } else CHECK(yyjson_od_doc_err(&sd) == e);
+        }
+    }
 }
 
 static uint64_t rs = ((uint64_t)0x139408dcu << 32) | 0xbbf7a44u;
@@ -369,12 +398,63 @@ static void fuzz(long iters, char **files, int nf) {
     if (mism) g_fail++;
 }
 
+/* random valid document generator (deep nesting, escapes, near-end keys) */
+static size_t gen_val(char *m, size_t n, size_t cap, int dep) {
+    unsigned t = rnd() % (dep > 12 ? 4u : 7u), k, cnt;
+    static const char *strs[] = {"\"\"", "\"a\"", "\"k\"", "\"x\\\"y\"", "\"\\\\\"",
+                                 "\"\\u00e9z\"", "\"\xc3\xa9\"", "\"kk\"", "\"k\\n\""};
+    static const char *nums[] = {"0", "-0", "1", "-1", "12345678", "123456789012",
+                                 "18446744073709551615", "-9223372036854775808",
+                                 "1.5", "-2e-3", "1E+400", "99999999999999999999"};
+    if (n + 64 >= cap) t = 0;
+    switch (t) {
+    case 0: { const char *x = nums[rnd() % 12]; size_t l = strlen(x); memcpy(m + n, x, l); return n + l; }
+    case 1: { const char *x = strs[rnd() % 9]; size_t l = strlen(x); memcpy(m + n, x, l); return n + l; }
+    case 2: { const char *x = rnd() % 3 == 0 ? "null" : rnd() % 2 ? "true" : "false";
+              size_t l = strlen(x); memcpy(m + n, x, l); return n + l; }
+    case 3: case 5:
+        m[n++] = '['; cnt = rnd() % 5;
+        for (k = 0; k < cnt; k++) { if (k) m[n++] = ',';
+            if (rnd() % 4 == 0) m[n++] = ' ';
+            n = gen_val(m, n, cap, dep + 1); }
+        m[n++] = ']'; return n;
+    default:
+        m[n++] = '{'; cnt = rnd() % 5;
+        for (k = 0; k < cnt; k++) { const char *x = strs[rnd() % 9]; size_t l = strlen(x);
+            if (k) m[n++] = ',';
+            memcpy(m + n, x, l);
+            n += l;
+            if (rnd() % 4 == 0) m[n++] = ' ';
+            m[n++] = ':';
+            if (rnd() % 4 == 0) m[n++] = '\n';
+            n = gen_val(m, n, cap, dep + 1); }
+        m[n++] = '}'; return n;
+    }
+}
+
+static void fuzz_valid(long iters) {
+    char *m = (char *)malloc(1 << 16);
+    long it, mism = 0, acc = 0;
+    int j;
+    for (it = 0; it < iters; it++) {
+        size_t n = gen_val(m, 0, 60000, 0);
+        if (rnd() % 8 == 0 && n) n = rnd() % n; /* truncated: invalid */
+        j = diff(m, n, mism < 10);
+        if (j == 1) mism++;
+        if (j == 0) acc++;
+    }
+    free(m);
+    printf("valid fuzz: %ld iters, %ld accepted, %ld mismatches\n", iters, acc, mism);
+    if (mism) g_fail++;
+}
+
 int main(int argc, char **argv) {
     long iters = argc > 1 ? atol(argv[1]) : 20000;
     if (argc > 2) rs ^= (uint64_t)atol(argv[2]) * 2654435761u;
     P = yyjson_od_parser_new(NULL);
     unit();
     fuzz(iters, argv + 3, argc > 3 ? argc - 3 : 0);
+    fuzz_valid(iters / 2);
     yyjson_od_parser_free(P);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);
     (void)has_esc_key;
