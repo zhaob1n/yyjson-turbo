@@ -4847,7 +4847,25 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #    define YYJSON_READ_SIMD_GATE 32
 #  endif
 #endif
-#if YYJSON_READ_OUTLINE
+#ifndef YYJSON_READ_KEY_GATE
+#  if defined(__clang__)
+#    define YYJSON_READ_KEY_GATE 32
+#  else
+#    define YYJSON_READ_KEY_GATE YYJSON_READ_SIMD_GATE
+#  endif
+#endif
+#ifndef YYJSON_SKIP_SIMD_INL
+#  if defined(__clang__)
+#    define YYJSON_SKIP_SIMD_INL 2
+#  else
+#    define YYJSON_SKIP_SIMD_INL 0
+#  endif
+#endif
+#if YYJSON_SKIP_SIMD_INL == 1
+#  define skip_ascii_simd_attr static_inline
+#elif YYJSON_SKIP_SIMD_INL == 2
+#  define skip_ascii_simd_attr static_noinline
+#elif YYJSON_READ_OUTLINE
 #  define skip_ascii_simd_attr static_noinline
 #else
 #  define skip_ascii_simd_attr static_inline
@@ -4894,7 +4912,7 @@ skip_ascii_simd_attr u8 *skip_ascii_simd(u8 *src, u8 *eof) {
  @param con Continuation for incremental parsing.
  @return Whether success.
  */
-static_inline bool read_str_opt(u8 quo, u8 **ptr, u8 *eof, yyjson_read_flag flg,
+static_inline bool read_str_opt(u8 quo, usize gate, u8 **ptr, u8 *eof, yyjson_read_flag flg,
                                 yyjson_val *val, const char **msg, u8 *con[2]) {
     /*
      GCC may sometimes load variables into registers too early, causing
@@ -4953,11 +4971,7 @@ skip_ascii:
 #if YYJSON_STR_SIMD_AVX512
     if (eof - src >= 64) src = skip_ascii_simd(src, eof);
 #elif YYJSON_STR_SIMD_AVX2
-#if YYJSON_READ_SIMD_GATE > 16
-    if (src - hdr >= YYJSON_READ_SIMD_GATE && eof - src >= 32)
-#else
-    if (eof - src >= 32)
-#endif
+    if ((gate <= 16 || (usize)(src - hdr) >= gate) && eof - src >= 32)
         src = skip_ascii_simd(src, eof);
 #endif
     goto skip_ascii;
@@ -5227,17 +5241,23 @@ copy_utf8:
 
 static_inline bool read_str(u8 **ptr, u8 *eof, yyjson_read_flag flg,
                             yyjson_val *val, const char **msg) {
-    return read_str_opt('\"', ptr, eof, flg, val, msg, NULL);
+    return read_str_opt('\"', YYJSON_READ_SIMD_GATE, ptr, eof, flg, val, msg, NULL);
 }
 
 static_inline bool read_str_con(u8 **ptr, u8 *eof, yyjson_read_flag flg,
                                 yyjson_val *val, const char **msg, u8 **con) {
-    return read_str_opt('\"', ptr, eof, flg, val, msg, con);
+    return read_str_opt('\"', YYJSON_READ_SIMD_GATE, ptr, eof, flg, val, msg, con);
+}
+
+static_inline bool read_str_key(u8 **ptr, u8 *eof, yyjson_read_flag flg,
+                                 yyjson_val *val, const char **msg) {
+    return read_str_opt('\"', YYJSON_READ_KEY_GATE, ptr, eof, flg, val, msg,
+                        NULL);
 }
 
 static_noinline bool read_str_sq(u8 **ptr, u8 *eof, yyjson_read_flag flg,
                                  yyjson_val *val, const char **msg) {
-    return read_str_opt('\'', ptr, eof, flg, val, msg, NULL);
+    return read_str_opt('\'', YYJSON_READ_SIMD_GATE, ptr, eof, flg, val, msg, NULL);
 }
 
 /** Read unquoted key (identifier name). */
@@ -5733,7 +5753,7 @@ obj_key_begin:
     if (likely(*cur == '"')) {
         val_incr();
         ctn_len++;
-        if (likely(read_str(&cur, eof, flg, val, &msg))) goto obj_key_end;
+        if (likely(read_str_key(&cur, eof, flg, val, &msg))) goto obj_key_end;
         goto fail_string;
     }
     if (likely(*cur == '}')) {
@@ -6193,7 +6213,7 @@ obj_key_begin:
     if (likely(*cur == '"')) {
         val_incr();
         ctn_len++;
-        if (likely(read_str(&cur, eof, flg, val, &msg))) goto obj_key_end;
+        if (likely(read_str_key(&cur, eof, flg, val, &msg))) goto obj_key_end;
         goto fail_string;
     }
     if (likely(*cur == '}')) {
@@ -8963,7 +8983,7 @@ obj_key_continue:
     if (likely(*cur == '"')) {
         val_incr();
         ctn_len++;
-        if (likely(read_str_con(&cur, end, flg, val, &msg, con)))
+        if (likely(read_str_key_con(&cur, end, flg, val, &msg, con)))
             goto obj_key_end;
         goto fail_string;
     }
