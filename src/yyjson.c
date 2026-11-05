@@ -4826,12 +4826,17 @@ static_inline bool read_uni_esc(u8 **src_ptr, u8 **dst_ptr, const char **msg) {
 #undef return_err
 }
 
-/* Code placement of the optional readers. Keeping the new code out of line
-   is faster for both gcc and clang on real hardware (i5-12600KF, perf
-   cycles): inlining it into the gcc reader kept the instruction count equal
-   but cost 3-7% cycles on short-string documents (instruments, twitter). */
+/* Code placement of the optional readers. gcc: out of line (inlining kept
+   the instruction count equal but cost 3-7% cycles on short-string documents
+   such as instruments and twitter, i5-12600KF perf cycles). clang: inline;
+   out of line cost 2-3% more instructions than upstream on citm, instruments,
+   marine_ik and twitter, inline is within -1%..+1% of upstream. */
 #ifndef YYJSON_READ_OUTLINE
-#  define YYJSON_READ_OUTLINE 1
+#  if defined(__clang__)
+#    define YYJSON_READ_OUTLINE 0
+#  else
+#    define YYJSON_READ_OUTLINE 1
+#  endif
 #endif
 /* Bytes scanned by the scalar loop before the vector scan is tried. gcc's
    reader loses cycles when 16-48 byte strings enter the vector scan. */
@@ -10818,13 +10823,18 @@ static_inline const char_enc_type *get_enc_table_with_flag(
 /** Copy clean ASCII 32 bytes at a time (outlined to keep write_str codegen
     unchanged). Returns the first unconsumed source byte. */
 static yyjson_noinline const u8 *write_ascii_simd(u8 *cur, const u8 *src,
-                                                  const u8 *end) {
+                                                  const u8 *end,
+                                                  const char_enc_type *tab) {
+    /* '/' only stops the copy when the table escapes it (ESCAPE_SLASHES);
+       otherwise compare against '"' again so URLs stay on the fast path. */
+    const __m256i vs = _mm256_set1_epi8(
+        (char)(tab['/'] == CHAR_ENC_CPY_1 ? '"' : '/'));
     while (end - src >= 32) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
         __m256i m = _mm256_or_si256(
             _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')),
                             _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'))),
-            _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, vs),
                             _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), v)));
         if (_mm256_movemask_epi8(m)) break;
         _mm256_storeu_si256((__m256i *)(void *)cur, v);
@@ -10911,13 +10921,14 @@ copy_ascii:
 
 #if YYJSON_STR_SIMD_AVX2 || YYJSON_STR_SIMD_AVX512
     /* 16 scalar bytes first; only long clean strings go to SIMD. Conservative
-       superset of chars that may need escaping: <0x20, >=0x80, '"', '\\', '/'. */
+       superset of chars that may need escaping: <0x20, >=0x80, '"', '\\',
+       and '/' when the table escapes it. */
     if (end - src >= 48) {
         repeat16_incr(expr_jump)
         byte_copy_16(cur, src);
         cur += 16; src += 16;
         {
-            const u8 *s2 = write_ascii_simd(cur, src, end);
+            const u8 *s2 = write_ascii_simd(cur, src, end, enc_table);
             cur += s2 - src; src = s2;
         }
     }
