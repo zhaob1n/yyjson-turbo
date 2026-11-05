@@ -5249,6 +5249,13 @@ static_inline bool read_str_con(u8 **ptr, u8 *eof, yyjson_read_flag flg,
     return read_str_opt('\"', YYJSON_READ_SIMD_GATE, ptr, eof, flg, val, msg, con);
 }
 
+static_inline bool read_str_key_con(u8 **ptr, u8 *eof, yyjson_read_flag flg,
+                                     yyjson_val *val, const char **msg,
+                                     u8 **con) {
+    return read_str_opt('\"', YYJSON_READ_KEY_GATE, ptr, eof, flg, val, msg,
+                        con);
+}
+
 static_inline bool read_str_key(u8 **ptr, u8 *eof, yyjson_read_flag flg,
                                  yyjson_val *val, const char **msg) {
     return read_str_opt('\"', YYJSON_READ_KEY_GATE, ptr, eof, flg, val, msg,
