@@ -7942,6 +7942,10 @@ static_noinline int s1_read(u8 *hdr, u8 *eof, yyjson_alc alc,
 #ifdef YYJSON_S1_PROF
         s1_prof_t[1] += __rdtsc() - t0; s1_prof_t[2] += ntok;
 #endif
+        /* oom is only possible before any write to hdr (the value array
+           is allocated first; the string pool is only used with
+           NO_NUL_TERM, which never writes the input), so the regular
+           reader may still retry on the untouched buffer */
         ret = *doc_out ? 0 : (oom ? 1 : 2);
     }
 #ifdef YYJSON_S1_PROF
@@ -7977,23 +7981,10 @@ yyjson_api bool yyjson_od__index(const u8 *buf, usize len, u32 *idx,
     return s1_index_od(buf, len, idx, ntok);
 }
 
-static_inline bool od_hex4(const u8 *p, u32 *cp) {
-    u32 v = 0, i;
-    for (i = 0; i < 4; i++) {
-        u8 c = p[i];
-        if (c >= '0' && c <= '9') v = (v << 4) | (u32)(c - '0');
-        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f')
-            v = (v << 4) | (u32)((c | 0x20) - 'a' + 10);
-        else return false;
-    }
-    *cp = v;
-    return true;
-}
 /* One escape sequence at src (src[0] is a backslash, src < end): decodes
    into *pdst, returns the new src or NULL. */
 static_inline const u8 *od_esc1(const u8 *src, const u8 *end, u8 **pdst) {
     u8 *dst = *pdst;
-    u32 cp, lo;
     if (end - src < 2) return NULL;
     switch (src[1]) {
         case '"':  *dst++ = '"';  src += 2; break;
@@ -8004,34 +7995,16 @@ static_inline const u8 *od_esc1(const u8 *src, const u8 *end, u8 **pdst) {
         case 'n':  *dst++ = '\n'; src += 2; break;
         case 'r':  *dst++ = '\r'; src += 2; break;
         case 't':  *dst++ = '\t'; src += 2; break;
-        case 'u':
-            if (end - src < 6 || !od_hex4(src + 2, &cp)) return NULL;
-            src += 6;
-            if ((cp & 0xFC00) == 0xD800) {
-                if (end - src < 6 || src[0] != '\\' || src[1] != 'u' ||
-                    !od_hex4(src + 2, &lo) || (lo & 0xFC00) != 0xDC00)
-                    return NULL;
-                src += 6;
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            } else if ((cp & 0xFC00) == 0xDC00) {
-                return NULL;
-            }
-            if (cp < 0x80) {
-                *dst++ = (u8)cp;
-            } else if (cp < 0x800) {
-                *dst++ = (u8)(0xC0 | (cp >> 6));
-                *dst++ = (u8)(0x80 | (cp & 0x3F));
-            } else if (cp < 0x10000) {
-                *dst++ = (u8)(0xE0 | (cp >> 12));
-                *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
-                *dst++ = (u8)(0x80 | (cp & 0x3F));
-            } else {
-                *dst++ = (u8)(0xF0 | (cp >> 18));
-                *dst++ = (u8)(0x80 | ((cp >> 12) & 0x3F));
-                *dst++ = (u8)(0x80 | ((cp >> 6) & 0x3F));
-                *dst++ = (u8)(0x80 | (cp & 0x3F));
-            }
+        case 'u': {
+            /* shared with the DOM reader; it reads at most 12 bytes and
+               stops at the closing quote (not a hex digit), which lies
+               inside the input, so the input padding covers it */
+            u8 *s = od_unconst(src);
+            const char *msg;
+            if (!read_uni_esc(&s, &dst, &msg)) return NULL;
+            src = s;
             break;
+        }
         default: return NULL;
     }
     *pdst = dst;

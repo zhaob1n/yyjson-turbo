@@ -895,7 +895,10 @@ static const yyjson_read_flag YYJSON_READ_ALLOW_UNQUOTED_KEY        = 1 << 13;
 
 /** Use the optional two-stage (SIMD structural index) reader.
     Only effective with no other flags except INSITU; otherwise ignored.
-    The produced DOM is identical to the regular reader. */
+    The produced DOM is identical to the regular reader. Invalid input is
+    rejected like the regular reader; with INSITU the input buffer may
+    already be modified, so the error is reported at position 0 with a
+    generic message instead of the exact position. */
 static const yyjson_read_flag YYJSON_READ_STAGE1                    = 1 << 15;
 
 /** Zero-copy strings for the two-stage reader (use with YYJSON_READ_STAGE1).

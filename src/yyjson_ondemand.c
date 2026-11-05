@@ -2,6 +2,9 @@
  * yyjson_ondemand.c - EXPERIMENTAL On Demand reader prototype.
  * See yyjson_ondemand.h.
  *============================================================================*/
+#ifdef YYJSON_DISABLE_STAGE1
+#error "yyjson_ondemand.c needs the stage 1 indexer: build yyjson.c without YYJSON_DISABLE_STAGE1"
+#endif
 #include "yyjson_ondemand.h"
 
 #include <stdlib.h>
